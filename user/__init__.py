@@ -1,0 +1,1 @@
+default_app_config = 'user.apps.UserConfig' # Use your_app_name.apps.YourAppConfigName
