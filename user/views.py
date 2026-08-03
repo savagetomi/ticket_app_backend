@@ -1,5 +1,6 @@
 import logging
 from datetime import timedelta
+from utils.email import send_otp_email
 
 from django.contrib.auth import authenticate
 from django.core.mail import EmailMultiAlternatives, send_mail
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class RegisterView(APIView):
+
     permission_classes = [AllowAny]
 
     @extend_schema(
@@ -45,18 +47,31 @@ class RegisterView(APIView):
             400: OpenApiResponse(description="Validation errors returned by the registration serializer"),
         }
     )
+    
+    # def post(self, request):
+    #     print("=== REGISTER VIEW HIT ===")
+    #     print("User:", request.user)
+    #     print("Auth:", request.auth)
+
+    #     return Response({"message": "Reached register view"})
+
+
     def post(self, request):
         serializer = UserRegistrationSerializers(data=request.data)
         if serializer.is_valid():
             user = serializer.save()
+            otp_obj, _ = OTP.objects.get_or_create(user=user)
+            code = otp_obj.generate_code()
+
+            send_otp_email(user, code)    
             refresh = RefreshToken.for_user(user)
             return Response({
-                'message': 'User registered successfully',
+                'message': 'User registered successfully, Please verify your mail',
                 'user': UserSerializer(user).data,
-                'tokens': {
-                    'refresh': str(refresh),
-                    'access': str(refresh.access_token),
-                }
+                # 'tokens': {
+                #     'refresh': str(refresh),
+                #     'access': str(refresh.access_token),
+                # }
             }, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -106,20 +121,32 @@ class LoginView(APIView):
 
         user = authenticate(email_address=email_address, password=password)
 
-        if user is not None:
-            access = AccessToken.for_user(user)
-            refresh = RefreshToken.for_user(user)
-            return Response({
-                "success": True,
-                "message": "User login successful",
-                "access": str(access),
-                "refresh": str(refresh)
-            }, status=status.HTTP_200_OK)
+        if user is None:
+            return Response(
+                {
+                    "success": False,
+                    "message": "Invalid email or password.",
+                },
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
 
-        return Response(
-            {"success": False, "message": "Invalid email or password"},
-            status=status.HTTP_401_UNAUTHORIZED
-        )
+        if not user.email_verified:
+            return Response(
+                {
+                    "success": False,
+                    "message": "Please verify your email before logging in.",
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        
+        refresh = RefreshToken.for_user(user)
+        return Response({
+            "success": True,
+            "message": "User login successful",
+            "email_verified": user.email_verified,
+            "access": str(refresh.access_token),
+            "refresh": str(refresh)
+        }, status=status.HTTP_200_OK)
 
 
 class LogoutView(APIView):
@@ -203,58 +230,167 @@ class VerifyOTPView(APIView):
             ),
         }
     )
-    def post(self, request):
-        email = request.data.get('email_address')
-        otp_code = request.data.get('otp_code')
-        
-        # 1. Input Validation
+ def post(self, request):
+
+
+
+        email = request.data.get("email_address")
+
+        otp_code = request.data.get("otp_code")
+
+
+
         if not email or not otp_code:
+
             return Response(
-                {'message': "Email and OTP code are required.", 'success': False}, 
-                status=status.HTTP_400_BAD_REQUEST
+
+                {
+
+                    "success": False,
+
+                    "message": "Email address and OTP code are required."
+
+                },
+
+                status=status.HTTP_400_BAD_REQUEST,
+
             )
-        
+
+
+
         try:
-            # 2. Lookup OTP object by user's email
-            # We use the relationship (user__email_address) for the lookup
-            otp_obj = OTP.objects.get(user__email_address=email)
 
-            # --- CRITICAL ADDITION 1: EXPIRATION CHECK ---
-            if not otp_obj.is_valid():
-                otp_obj.delete() # Consume the expired code
-                return Response(
-                    {'message': "OTP code has expired. Please request a new one.", 'success': False}, 
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+            user = CustomUser.objects.get(email_address=email)
 
-            # --- CRITICAL ADDITION 2: CODE MATCH CHECK ---
-            # Use the model's is_match if you added it, otherwise direct comparison is fine
-            if otp_obj.otp_code == otp_code: 
-                # SUCCESS ACTIONS
-                user = otp_obj.user
-                user.email_verified = True
-                user.save()
-                otp_obj.delete() # Consume the one-time code
-                
-                return Response(
-                    {'message': "Successfully Verified", 'success': True}, 
-                    status=status.HTTP_202_ACCEPTED
-                )
-            else:
-                return Response(
-                    {'message': "Invalid OTP", 'success': False}, 
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
+
+
+        except CustomUser.DoesNotExist:
+
+            return Response(
+
+                {
+
+                    "success": False,
+
+                    "message": "User not found."
+
+                },
+
+                status=status.HTTP_404_NOT_FOUND,
+
+            )
+
+
+
+        try:
+
+            otp = OTP.objects.get(user=user)
+
+
+
         except OTP.DoesNotExist:
-            # Covers both "no such user" and "no pending OTP" since this lookup
-            # can only ever raise OTP.DoesNotExist, never CustomUser.DoesNotExist
-            return Response({'message': "No pending verification found for this user.", 'success': False}, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            logger.exception("OTP verification error")
-            return Response({'message': "An unexpected error occurred during verification.", 'success': False}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            return Response(
+
+                {
+
+                    "success": False,
+
+                    "message": "No OTP found. Please request a new OTP."
+
+                },
+
+                status=status.HTTP_404_NOT_FOUND,
+
+            )
 
 
+
+        # Check expiration
+
+        if not otp.is_valid():
+
+
+
+            otp.delete()
+
+
+
+            return Response(
+
+                {
+
+                    "success": False,
+
+                    "message": "OTP has expired. Please request another one."
+
+                },
+
+                status=status.HTTP_400_BAD_REQUEST,
+
+            )
+
+
+
+        # Check code
+
+        if otp.otp_code != otp_code:
+
+
+
+            return Response(
+
+                {
+
+                    "success": False,
+
+                    "message": "Invalid OTP."
+
+                },
+
+                status=status.HTTP_400_BAD_REQUEST,
+
+            )
+
+
+
+        # Verify account
+
+        user.email_verified = True
+
+        user.save(update_fields=["email_verified"])
+
+
+
+        # Delete OTP so it can't be reused
+
+        otp.delete()
+
+
+
+        # Generate JWT tokens
+
+        refresh = RefreshToken.for_user(user)
+
+
+
+        return Response(
+
+            {
+
+                "success": True,
+
+                "message": "Email verified successfully.",
+
+                "access": str(refresh.access_token),
+
+                "refresh": str(refresh),
+
+            },
+
+            status=status.HTTP_200_OK,
+
+        )
 class ResendOTPView(APIView):
     """
     API endpoint to handle the resending of a verification OTP, 
@@ -428,13 +564,9 @@ class GenerateOTPView(APIView):
 
             # Send email
             try:
-                send_mail(
-                    subject="Your OTP Code",
-                    message=f"Your OTP is {code}",
-                    from_email="dhareykhaey3@gmail.com",
-                    recipient_list=[user.email_address],
-                    fail_silently=False
-                )
+                otp_obj, _ = OTP.objects.get_or_create(user=user)
+                code = otp_obj.generate_code()         
+                send_otp_email(user, code)
                 return Response({'message': f"OTP sent to {email}"}, status=status.HTTP_200_OK)
             except Exception:
                 logger.exception("Failed to send OTP email")
