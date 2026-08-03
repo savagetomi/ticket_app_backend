@@ -230,7 +230,7 @@ class VerifyOTPView(APIView):
             ),
         }
     )
- def post(self, request):
+    def post(self, request):
 
 
 
@@ -391,6 +391,8 @@ class VerifyOTPView(APIView):
             status=status.HTTP_200_OK,
 
         )
+
+    
 class ResendOTPView(APIView):
     """
     API endpoint to handle the resending of a verification OTP, 
