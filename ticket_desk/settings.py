@@ -125,6 +125,7 @@ SIMPLE_JWT = {
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
+    "https://ticket-app-backend-90z7.onrender.com/"
 ]
 
 TEMPLATES = [
