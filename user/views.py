@@ -1,19 +1,50 @@
-from rest_framework import status
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework.permissions import AllowAny, IsAuthenticated
-from rest_framework_simplejwt.tokens import RefreshToken, AccessToken
-from django.contrib.auth import authenticate
-from .serializer import UserRegistrationSerializers, UserLoginSerializer, UserSerializer
-from rest_framework import status
-from .models import CustomUser, OTP
+import logging
 from datetime import timedelta
+
+from django.contrib.auth import authenticate
+from django.core.mail import EmailMultiAlternatives, send_mail
+from django.template.loader import render_to_string
 from django.utils import timezone
+
+from drf_spectacular.utils import extend_schema, OpenApiResponse, inline_serializer
+from rest_framework import serializers, status
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
+
+from .models import CustomUser, OTP
+from .serializer import UserLoginSerializer, UserRegistrationSerializers, UserSerializer
+
+logger = logging.getLogger(__name__)
 
 
 class RegisterView(APIView):
     permission_classes = [AllowAny]
-    
+
+    @extend_schema(
+        tags=['Authentication'],
+        summary="Register a new user",
+        description="Creates a new user account and returns JWT tokens for immediate authentication.",
+        request=UserRegistrationSerializers,
+        responses={
+            201: inline_serializer(
+                name='RegisterSuccessResponse',
+                fields={
+                    'message': serializers.CharField(),
+                    'user': UserSerializer(),
+                    'tokens': inline_serializer(
+                        name='TokenPair',
+                        fields={
+                            'refresh': serializers.CharField(),
+                            'access': serializers.CharField(),
+                        }
+                    ),
+                }
+            ),
+            400: OpenApiResponse(description="Validation errors returned by the registration serializer"),
+        }
+    )
     def post(self, request):
         serializer = UserRegistrationSerializers(data=request.data)
         if serializer.is_valid():
@@ -32,82 +63,87 @@ class RegisterView(APIView):
 
 class LoginView(APIView):
     permission_classes = [AllowAny]
-    
-    def post(self, request):
 
+    @extend_schema(
+        tags=['Authentication'],
+        summary="Login with email and password",
+        description="Authenticates a user using email_address and password, returning JWT access and refresh tokens.",
+        request=inline_serializer(
+            name='LoginRequest',
+            fields={
+                'email_address': serializers.EmailField(),
+                'password': serializers.CharField(style={'input_type': 'password'}),
+            }
+        ),
+        responses={
+            200: inline_serializer(
+                name='LoginSuccessResponse',
+                fields={
+                    'success': serializers.BooleanField(),
+                    'message': serializers.CharField(),
+                    'access': serializers.CharField(),
+                    'refresh': serializers.CharField(),
+                }
+            ),
+            400: inline_serializer(
+                name='LoginMissingFieldsResponse',
+                fields={'message': serializers.CharField()}
+            ),
+            401: inline_serializer(
+                name='LoginInvalidCredentialsResponse',
+                fields={'success': serializers.BooleanField(), 'message': serializers.CharField()}
+            ),
+        }
+    )
+    def post(self, request):
         email_address = request.data.get("email_address")
         password = request.data.get('password')
 
-        print(email_address)
-        print(password)
-        print(f'Login attempt by - {email_address}')
-
         if not email_address or not password:
-            print("Yess")
-            return Response ({
-                'message':'please provide both details'
-            }, status=status.HTTP_401_UNAUTHORIZED)
-
-        try:
-            user_by_email = CustomUser.objects.get(email_address=email_address)
-            print(f"User found by email: {user_by_email.username}")
-            print(f"User is_active: {user_by_email.is_active}")
-        except CustomUser.DoesNotExist:
-            print("No user found with this email")
-            user_by_email = None
+            return Response({
+                'message': 'Please provide both email address and password.'
+            }, status=status.HTTP_400_BAD_REQUEST)
 
         user = authenticate(email_address=email_address, password=password)
 
-        print(f"Authenticate result: {user}")
-
         if user is not None:
-            print("hiiiii")
-
-            # if user.is_suspended:
-            #     return Response({
-            #         "message": "Account is Suspended",
-            #         "suspension_reason": user.suspension_reason,
-            #         "suspension_until": user.suspension_until,
-            #     }, status=status.HTTP_403_FORBIDDEN)
-
             access = AccessToken.for_user(user)
             refresh = RefreshToken.for_user(user)
-            print(access)
-            print(refresh)
-            print("Thank you Jesus")
             return Response({
                 "success": True,
                 "message": "User login successful",
                 "access": str(access),
-                "refresh": str(refresh)}, 
-                status=status.HTTP_200_OK)
-        else:
-            print("God abeg")
-            return Response({"message": "Account Not Found"}, status=status.HTTP_404_NOT_FOUND)
-        
-        serializer = UserLoginSerializer(data=request.data)
-        # if serializer.is_valid():
-        #     user = authenticate(
-        #         username=serializer.validated_data['email_address'],
-        #         password=serializer.validated_data['password']
-        #     )
-        #     if user:
-        #         refresh = RefreshToken.for_user(user)
-        #         return Response({
-        #             'message': 'Login successful',
-        #             'user': UserSerializer(user).data,
-        #             'tokens': {
-        #                 'refresh': str(refresh),
-        #                 'access': str(refresh.access_token),
-        #             }
-        #         })
-        #     return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
-        # return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+                "refresh": str(refresh)
+            }, status=status.HTTP_200_OK)
+
+        return Response(
+            {"success": False, "message": "Invalid email or password"},
+            status=status.HTTP_401_UNAUTHORIZED
+        )
 
 
 class LogoutView(APIView):
     permission_classes = [IsAuthenticated]
-    
+
+    @extend_schema(
+        tags=['Authentication'],
+        summary="Logout the current user",
+        description="Blacklists the provided refresh token, logging the user out.",
+        request=inline_serializer(
+            name='LogoutRequest',
+            fields={'refresh_token': serializers.CharField()}
+        ),
+        responses={
+            200: inline_serializer(
+                name='LogoutSuccessResponse',
+                fields={'message': serializers.CharField()}
+            ),
+            400: inline_serializer(
+                name='LogoutErrorResponse',
+                fields={'error': serializers.CharField()}
+            ),
+        }
+    )
     def post(self, request):
         try:
             refresh_token = request.data.get('refresh_token')
@@ -120,15 +156,53 @@ class LogoutView(APIView):
 
 class ProfileView(APIView):
     permission_classes = [IsAuthenticated]
-    
+
+    @extend_schema(
+        tags=['Authentication'],
+        summary="Retrieve the authenticated user's profile",
+        description="Returns the profile details of the currently authenticated user.",
+        responses={200: UserSerializer}
+    )
     def get(self, request):
         serializer = UserSerializer(request.user)
         return Response(serializer.data)
-    
+
+
 class VerifyOTPView(APIView):
     """
     Handles verification of the submitted OTP code, checking for expiration.
     """
+
+    @extend_schema(
+        tags=['OTP'],
+        summary="Verify an OTP code",
+        description="Validates a submitted OTP code against the stored code for the given email, checking expiration.",
+        request=inline_serializer(
+            name='VerifyOTPRequest',
+            fields={
+                'email_address': serializers.EmailField(),
+                'otp_code': serializers.CharField(),
+            }
+        ),
+        responses={
+            202: inline_serializer(
+                name='VerifyOTPSuccessResponse',
+                fields={'message': serializers.CharField(), 'success': serializers.BooleanField()}
+            ),
+            400: inline_serializer(
+                name='VerifyOTPBadRequestResponse',
+                fields={'message': serializers.CharField(), 'success': serializers.BooleanField()}
+            ),
+            404: inline_serializer(
+                name='VerifyOTPNotFoundResponse',
+                fields={'message': serializers.CharField(), 'success': serializers.BooleanField()}
+            ),
+            500: inline_serializer(
+                name='VerifyOTPServerErrorResponse',
+                fields={'message': serializers.CharField(), 'success': serializers.BooleanField()}
+            ),
+        }
+    )
     def post(self, request):
         email = request.data.get('email_address')
         otp_code = request.data.get('otp_code')
@@ -144,7 +218,6 @@ class VerifyOTPView(APIView):
             # 2. Lookup OTP object by user's email
             # We use the relationship (user__email_address) for the lookup
             otp_obj = OTP.objects.get(user__email_address=email)
-            print(f"Found OTP: {otp_obj.otp_code}")
 
             # --- CRITICAL ADDITION 1: EXPIRATION CHECK ---
             if not otp_obj.is_valid():
@@ -174,71 +247,13 @@ class VerifyOTPView(APIView):
                 )
             
         except OTP.DoesNotExist:
-            # This handles cases where the email/user exists but no OTP record is found
+            # Covers both "no such user" and "no pending OTP" since this lookup
+            # can only ever raise OTP.DoesNotExist, never CustomUser.DoesNotExist
             return Response({'message': "No pending verification found for this user.", 'success': False}, status=status.HTTP_404_NOT_FOUND)
-        except CustomUser.DoesNotExist:
-            # Should be caught by the OTP.DoesNotExist, but good to have as a fallback
-             return Response({'message': "User not found.", 'success': False}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
-            print(f"Verification error: {e}")
+            logger.exception("OTP verification error")
             return Response({'message': "An unexpected error occurred during verification.", 'success': False}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-# class ResendOTPView(APIView):
-#     def post(self, request):
-#         email = request.data.get('email_address')
-
-#         try:
-#             email_add = CustomUser.objects.get(email_address=email)
-#             if email_add.email_verified == False:
-#                 otp_obj, created = OTP.objects.get_or_create(user=email_add)
-#                 new_otp_code = otp_obj.generate_code()
-#                 return Response({'message': 'OTP Sent', "success": True}, status=status.HTTP_200_OK)
-#             else:
-#                 return Response({'message':'Email verified', "success": False}, status=status.HTTP_400_BAD_REQUEST)
-#         except CustomUser.DoesNotExist:
-#             return Response({'account not found'}, status=status.HTTP_404_NOT_FOUND)
-
-#         # --- 4. Prepare and Send NEW Email ---
-        
-#         subject = 'New Verification Code'
-#         from_email = 'tickethub.net@gmail.com'
-#         to = [user.email]
-
-#         context = {
-#             "username": user.email,
-#             "description": new_otp_code,
-#         }
-        
-#         html_content = render_to_string("otp_message.html", context)
-#         text_content = f"Your new verification code is: {new_otp_code}"
-        
-#         msg = EmailMultiAlternatives(
-#             subject=subject,
-#             body=text_content, 
-#             from_email=from_email,
-#             to=to,
-#         )
-#         msg.attach_alternative(html_content, "text/html")
-        
-#         try:
-#             msg.send()
-#             return Response(
-#                 {'message': "New OTP has been sent.", 'success': True}, 
-#                 status=status.HTTP_200_OK
-#             )
-#         except Exception as e:
-#             # If the email fails, we might still return success but log the error, 
-#             # or return a specific error if email failure is critical.
-#             print(f"Failed to resend email: {e}")
-#             return Response(
-#                 {'message': "OTP updated, but email send failed.", 'success': False}, 
-#                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
-#             )
-        
-# users/views.py
-
-from django.template.loader import render_to_string
-from django.core.mail import EmailMultiAlternatives, send_mail
 
 class ResendOTPView(APIView):
     """
@@ -247,7 +262,42 @@ class ResendOTPView(APIView):
     """
     # Set the minimum wait time for clarity and easy modification
     MIN_RESEND_WAIT = timedelta(minutes=2) 
-    
+
+    @extend_schema(
+        tags=['OTP'],
+        summary="Resend a verification OTP",
+        description="Generates and emails a new OTP code, enforcing a minimum wait time between resend requests.",
+        request=inline_serializer(
+            name='ResendOTPRequest',
+            fields={'email_address': serializers.EmailField()}
+        ),
+        responses={
+            200: inline_serializer(
+                name='ResendOTPSuccessResponse',
+                fields={'message': serializers.CharField(), 'success': serializers.BooleanField()}
+            ),
+            400: inline_serializer(
+                name='ResendOTPBadRequestResponse',
+                fields={'message': serializers.CharField(), 'success': serializers.BooleanField()}
+            ),
+            404: inline_serializer(
+                name='ResendOTPNotFoundResponse',
+                fields={'message': serializers.CharField(), 'success': serializers.BooleanField()}
+            ),
+            409: inline_serializer(
+                name='ResendOTPConflictResponse',
+                fields={'message': serializers.CharField(), 'success': serializers.BooleanField()}
+            ),
+            429: inline_serializer(
+                name='ResendOTPRateLimitedResponse',
+                fields={'message': serializers.CharField(), 'success': serializers.BooleanField()}
+            ),
+            500: inline_serializer(
+                name='ResendOTPServerErrorResponse',
+                fields={'message': serializers.CharField(), 'success': serializers.BooleanField()}
+            ),
+        }
+    )
     def post(self, request):
         email = request.data.get('email_address')
         
@@ -263,8 +313,6 @@ class ResendOTPView(APIView):
             user = CustomUser.objects.get(email_address=email)
             otp_obj, created = OTP.objects.get_or_create(user=user)
 
-            print(f"OTP created at (DB time): {otp_obj.otp_last_generated}")
-            
             # Prevent resending if the user is already verified
             if user.email_verified:
                 return Response(
@@ -289,18 +337,17 @@ class ResendOTPView(APIView):
             
             # 4. Generate NEW Code and Expiry 
             # This uses the correct, zero-padded, time-setting method in the OTP model
-            new_otp_code = otp_obj.generate_code() 
-            print(f"Resending OTP: {new_otp_code}")
+            new_otp_code = otp_obj.generate_code()
 
         except CustomUser.DoesNotExist:
             return Response(
                 {'message': "User not found with this email.", 'success': False}, 
                 status=status.HTTP_404_NOT_FOUND
             )
-        except Exception as e:
-            print(f"Error during OTP generation: {e}")
+        except Exception:
+            logger.exception("Error during OTP generation")
             return Response(
-                {'message': f"An internal error occurred: {e}", 'success': False}, # Simplified message for user
+                {'message': "An internal error occurred. Please try again later.", 'success': False},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
@@ -335,16 +382,41 @@ class ResendOTPView(APIView):
                 {'message': "New OTP has been sent.", 'success': True}, 
                 status=status.HTTP_200_OK
             )
-        except Exception as e:
+        except Exception:
             # If the email failed, the OTP is still valid in the DB, but the user didn't get it.
             # It's safest to return a 500 here, as the user must receive the code.
-            print(f"Failed to resend email: {e}")
+            logger.exception("Failed to send resend-OTP email")
             return Response(
                 {'message': "OTP updated, but email service failed to send the message.", 'success': False}, 
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+
 class GenerateOTPView(APIView):
+
+    @extend_schema(
+        tags=['OTP'],
+        summary="Generate and send an initial OTP",
+        description="Creates an OTP for the given user and emails the code.",
+        request=inline_serializer(
+            name='GenerateOTPRequest',
+            fields={'email_address': serializers.EmailField()}
+        ),
+        responses={
+            200: inline_serializer(
+                name='GenerateOTPSuccessResponse',
+                fields={'message': serializers.CharField()}
+            ),
+            404: inline_serializer(
+                name='GenerateOTPNotFoundResponse',
+                fields={'message': serializers.CharField()}
+            ),
+            500: inline_serializer(
+                name='GenerateOTPServerErrorResponse',
+                fields={'message': serializers.CharField()}
+            ),
+        }
+    )
     def post(self, request):
         email = request.data.get('email_address')
         try:
@@ -353,7 +425,6 @@ class GenerateOTPView(APIView):
             # Create OTP
             otp_obj, _ = OTP.objects.get_or_create(user=user)
             code = otp_obj.generate_code()
-            print(code)
 
             # Send email
             try:
@@ -361,12 +432,13 @@ class GenerateOTPView(APIView):
                     subject="Your OTP Code",
                     message=f"Your OTP is {code}",
                     from_email="dhareykhaey3@gmail.com",
-                    recipient_list=[user.email_address, "dhareykhaey4@gmail.com"],
+                    recipient_list=[user.email_address],
                     fail_silently=False
                 )
                 return Response({'message': f"OTP sent to {email}"}, status=status.HTTP_200_OK)
-            except Exception as e:
-                return Response({'message': f"Failed to send email: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            except Exception:
+                logger.exception("Failed to send OTP email")
+                return Response({'message': "Failed to send email"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         except CustomUser.DoesNotExist:
             return Response({'message': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
