@@ -1,14 +1,12 @@
-import resend
 from django.conf import settings
-
-resend.api_key = settings.RESEND_API_KEY
-
-
+from django.core.mail import EmailMultiAlternatives
 from django.template.loader import render_to_string
 
 
 def send_otp_email(user, otp_code):
-    html = render_to_string(
+    subject = "Verify your TicketHub account"
+
+    html_content = render_to_string(
         "user/otp_message.html",
         {
             "username": user.email_address,
@@ -16,10 +14,12 @@ def send_otp_email(user, otp_code):
         },
     )
 
-    resend.Emails.send({
-        "from": settings.RESEND_FROM_EMAIL,
-        "to": [user.email_address],
-        "subject": "Verify your TicketHub account",
-        "html": html,
-    })
+    email = EmailMultiAlternatives(
+        subject=subject,
+        body=f"Your OTP is {otp_code}",
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        to=[user.email_address],
+    )
 
+    email.attach_alternative(html_content, "text/html")
+    email.send()

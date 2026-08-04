@@ -13,6 +13,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError
 
 from .models import CustomUser, OTP
 from .serializer import UserLoginSerializer, UserRegistrationSerializers, UserSerializer
@@ -153,32 +154,64 @@ class LogoutView(APIView):
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
-        tags=['Authentication'],
+        tags=["Authentication"],
         summary="Logout the current user",
         description="Blacklists the provided refresh token, logging the user out.",
         request=inline_serializer(
-            name='LogoutRequest',
-            fields={'refresh_token': serializers.CharField()}
+            name="LogoutRequest",
+            fields={
+                "refresh_token": serializers.CharField()
+            },
         ),
         responses={
             200: inline_serializer(
-                name='LogoutSuccessResponse',
-                fields={'message': serializers.CharField()}
+                name="LogoutSuccessResponse",
+                fields={
+                    "success": serializers.BooleanField(),
+                    "message": serializers.CharField(),
+                },
             ),
             400: inline_serializer(
-                name='LogoutErrorResponse',
-                fields={'error': serializers.CharField()}
+                name="LogoutErrorResponse",
+                fields={
+                    "success": serializers.BooleanField(),
+                    "message": serializers.CharField(),
+                },
             ),
-        }
+        },
     )
     def post(self, request):
+        refresh_token = request.data.get("refresh_token")
+
+        if not refresh_token:
+            return Response(
+                {
+                    "success": False,
+                    "message": "Refresh token is required.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         try:
-            refresh_token = request.data.get('refresh_token')
             token = RefreshToken(refresh_token)
             token.blacklist()
-            return Response({'message': 'Logout successful'}, status=status.HTTP_200_OK)
-        except Exception:
-            return Response({'error': 'Invalid token'}, status=status.HTTP_400_BAD_REQUEST)
+
+            return Response(
+                {
+                    "success": True,
+                    "message": "Logged out successfully.",
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except TokenError:
+            return Response(
+                {
+                    "success": False,
+                    "message": "Invalid or expired refresh token.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
 
 class ProfileView(APIView):
@@ -555,24 +588,42 @@ class GenerateOTPView(APIView):
             ),
         }
     )
+
     def post(self, request):
-        email = request.data.get('email_address')
+        email = request.data.get("email_address")
+
         try:
             user = CustomUser.objects.get(email_address=email)
 
-            # Create OTP
             otp_obj, _ = OTP.objects.get_or_create(user=user)
             code = otp_obj.generate_code()
 
-            # Send email
-            try:
-                otp_obj, _ = OTP.objects.get_or_create(user=user)
-                code = otp_obj.generate_code()         
-                send_otp_email(user, code)
-                return Response({'message': f"OTP sent to {email}"}, status=status.HTTP_200_OK)
-            except Exception:
-                logger.exception("Failed to send OTP email")
-                return Response({'message': "Failed to send email"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            send_otp_email(user, code)
+
+            return Response(
+                {
+                    "success": True,
+                    "message": f"OTP sent to {email}"
+                },
+                status=status.HTTP_200_OK
+            )
 
         except CustomUser.DoesNotExist:
-            return Response({'message': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {
+                    "success": False,
+                    "message": "User not found"
+                },
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        except Exception as e:
+            logger.exception(e)
+
+            return Response(
+                {
+                    "success": False,
+                    "message": str(e)
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )

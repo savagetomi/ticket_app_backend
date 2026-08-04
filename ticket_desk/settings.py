@@ -31,8 +31,8 @@ DEBUG = True
 
 
 #RESEND for Email OTP verification
-RESEND_API_KEY = os.getenv('RESEND_API_KEY')
-RESEND_FROM_EMAIL = os.getenv('RESEND_FROM_EMAIL')
+# RESEND_API_KEY = os.getenv('RESEND_API_KEY')
+# RESEND_FROM_EMAIL = os.getenv('RESEND_FROM_EMAIL')
 
 # CORS Settings - CRITICAL FOR FLUTTER CONNECTION
 # Option 1: Allow all origins (for development only!)
@@ -90,6 +90,7 @@ INSTALLED_APPS = [
     'corsheaders',
     'user',
     "drf_spectacular",
+
 ]
 
 MIDDLEWARE = [
