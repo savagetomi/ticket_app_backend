@@ -13,6 +13,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
+from rest_framework_simplejwt.serializers import TokenRefreshSerializer
 from rest_framework_simplejwt.exceptions import TokenError
 
 from .models import CustomUser, OTP
@@ -627,3 +628,57 @@ class GenerateOTPView(APIView):
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+class RefreshTokenView(APIView):
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        tags=['Authentication'],
+        summary="Refresh an access token",
+        description="Exchanges a valid refresh token for a new access token. If ROTATE_REFRESH_TOKENS is enabled in SIMPLE_JWT settings, a new refresh token is also returned and the old one is blacklisted.",
+        request=inline_serializer(
+            name='RefreshTokenRequest',
+            fields={'refresh': serializers.CharField()}
+        ),
+        responses={
+            200: inline_serializer(
+                name='RefreshTokenSuccessResponse',
+                fields={
+                    'success': serializers.BooleanField(),
+                    'access': serializers.CharField(),
+                    'refresh': serializers.CharField(required=False),
+                }
+            ),
+            400: inline_serializer(
+                name='RefreshTokenMissingResponse',
+                fields={'success': serializers.BooleanField(), 'message': serializers.CharField()}
+            ),
+            401: inline_serializer(
+                name='RefreshTokenInvalidResponse',
+                fields={'success': serializers.BooleanField(), 'message': serializers.CharField()}
+            ),
+        }
+    )
+    def post(self, request):
+        refresh_token = request.data.get('refresh_token')
+
+        if not refresh_token:
+            return Response(
+                {'success': False, 'message': 'Refresh token is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = TokenRefreshSerializer(data={'refresh': refresh_token})
+
+        try:
+            serializer.is_valid(raise_exception=True)
+        except TokenError as e:
+            logger.info("Refresh token rejected: %s", e)
+            return Response(
+                {'success': False, 'message': 'Refresh token is invalid or expired.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        data = serializer.validated_data
+        data['success'] = True
+        return Response(data, status=status.HTTP_200_OK)
