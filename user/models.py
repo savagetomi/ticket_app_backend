@@ -8,11 +8,17 @@ from datetime import timedelta
 
 # Create your models here.
 class CustomUser(AbstractUser):
+    USER_ROLES = (
+        ('user', 'User'),
+        ('host', 'Host'),
+        ('admin', 'Admin')
+    )
     id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False, primary_key=True)
     first_name = models.CharField(max_length=255, blank=False)
     last_name = models.CharField(max_length=255, blank=False)
     email_address = models.CharField(max_length=255, blank=False, unique=True)
     phone_number = models.CharField(max_length=255, blank=False)
+    roles = models.CharField(max_length=10, choices=USER_ROLES, default='user')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     username = models.CharField(max_length=255, unique=True, blank=True)

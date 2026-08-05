@@ -1,5 +1,6 @@
 import logging
 from datetime import timedelta
+import user
 from utils.email import send_otp_email
 
 from django.contrib.auth import authenticate
@@ -17,7 +18,7 @@ from rest_framework_simplejwt.serializers import TokenRefreshSerializer
 from rest_framework_simplejwt.exceptions import TokenError
 
 from .models import CustomUser, OTP
-from .serializer import UserLoginSerializer, UserRegistrationSerializers, UserSerializer
+from .serializer import UserLoginSerializer, UserRegistrationSerializers, UserSerializer, UserUpdateSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,7 @@ class RegisterView(APIView):
             send_otp_email(user, code)    
             refresh = RefreshToken.for_user(user)
             return Response({
+                'success': True,
                 'message': 'User registered successfully, Please verify your mail',
                 'user': UserSerializer(user).data,
                 # 'tokens': {
@@ -100,6 +102,7 @@ class LoginView(APIView):
                     'message': serializers.CharField(),
                     'access': serializers.CharField(),
                     'refresh': serializers.CharField(),
+                    'role': serializers.CharField(),
                 }
             ),
             400: inline_serializer(
@@ -146,6 +149,7 @@ class LoginView(APIView):
             "success": True,
             "message": "User login successful",
             "email_verified": user.email_verified,
+            "roles": user.roles,
             "access": str(refresh.access_token),
             "refresh": str(refresh)
         }, status=status.HTTP_200_OK)
@@ -227,6 +231,100 @@ class ProfileView(APIView):
     def get(self, request):
         serializer = UserSerializer(request.user)
         return Response(serializer.data)
+
+    @extend_schema(
+        tags=['Authentication'],
+        summary="Replace the authenticated user's profile",
+        description="Full update — all editable fields (first_name, last_name, username, phone_number) must be provided.",
+        request= UserUpdateSerializer,
+        responses={
+            200: inline_serializer(
+                name='ProfileUpdateSuccessResponse',
+                fields={'message': serializers.CharField(), 'user': UserSerializer()}
+            ),
+            400: OpenApiResponse(description="Validation errors"),
+        }
+    )
+    def put(self, request):
+        serializer = UserUpdateSerializer(request.user, data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(
+                {'message': 'Profile updated successfully', 'user': UserSerializer(request.user).data},
+                status=status.HTTP_200_OK
+            )
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @extend_schema(
+        tags=['Authentication'],
+        summary="Partially update the authenticated user's profile",
+        description="Partial update — only send the fields you want to change.",
+        request=UserUpdateSerializer,
+        responses={
+            200: inline_serializer(
+                name='ProfilePartialUpdateSuccessResponse',
+                fields={'message': serializers.CharField(), 'user': UserSerializer()}
+            ),
+            400: OpenApiResponse(description="Validation errors"),
+        }
+    )
+    def patch(self, request):
+        serializer = UserUpdateSerializer(request.user, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(
+                {'message': 'Profile updated successfully', 'user': UserSerializer(request.user).data},
+                status=status.HTTP_200_OK
+            )
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @extend_schema(
+        tags=['Authentication'],
+        summary="Deactivate the authenticated user's account",
+        description="Requires the user's current password as confirmation. Deactivates the account (is_active=False) and blacklists all of the user's outstanding refresh tokens, rather than hard-deleting the row.",
+        request=inline_serializer(
+            name='DeleteAccountRequest',
+            fields={'password': serializers.CharField(style={'input_type': 'password'})}
+        ),
+        responses={
+            200: inline_serializer(
+                name='DeleteAccountSuccessResponse',
+                fields={'message': serializers.CharField()}
+            ),
+            400: inline_serializer(
+                name='DeleteAccountMissingPasswordResponse',
+                fields={'message': serializers.CharField()}
+            ),
+            401: inline_serializer(
+                name='DeleteAccountWrongPasswordResponse',
+                fields={'message': serializers.CharField()}
+            ),
+        }
+    )
+    def delete(self, request):
+        password = request.data.get('password')
+
+        if not password:
+            return Response(
+                {'message': 'Please confirm your password to delete your account.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not request.user.check_password(password):
+            return Response(
+                {'message': 'Incorrect password.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        # Revoke every outstanding refresh token so old sessions can't refresh
+        # their way back to a live access token after deactivation.
+        for token in OutstandingToken.objects.filter(user=request.user):
+            BlacklistedToken.objects.get_or_create(token=token)
+
+        request.user.is_active = False
+        request.user.save()
+
+        return Response({'message': 'Account deactivated successfully'}, status=status.HTTP_200_OK)
 
 
 class VerifyOTPView(APIView):

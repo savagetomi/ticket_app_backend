@@ -11,7 +11,7 @@ class UserRegistrationSerializers(serializers.ModelSerializer):
 
     class Meta:
         model = CustomUser
-        fields = ["first_name","last_name","email_address","username","phone_number","username","password","confirm_password"] 
+        fields = ["first_name","last_name","email_address","username","phone_number","username","password","confirm_password", "roles"] 
 
     def validate_email_address(self, value):
         if CustomUser.objects.filter(email_address=value).exists():
@@ -85,5 +85,15 @@ class EmailOTP(serializers.Serializer):
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = CustomUser
-        fields = ['id', 'email_address', 'username', 'phone_number', 'created_at']
+        fields = ['id', 'email_address', 'username', 'phone_number', 'roles','created_at']
 
+class UserUpdateSerializer(serializers.ModelSerializer):
+    """
+    Restricted serializer for self-service profile edits.
+    Deliberately excludes id, email_address, roles, password, created_at,
+    updated_at, email_verified — none of those should change through a
+    generic PUT/PATCH.
+    """
+    class Meta:
+        model = CustomUser
+        fields = ['first_name', 'last_name', 'username', 'phone_number']
