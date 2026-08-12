@@ -17,15 +17,15 @@ class EventSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'host', 'created_at', 'updated_at']
 
-        def get_cover_image(self, obj):
-            request = self.context.get('request')
+    def get_cover_image(self, obj):
+        request = self.context.get('request')
 
-            if not obj.cover_image:
-                return None
+        if not obj.cover_image:
+            return None
 
-            if request:
-                return request.build_absolute_uri(
-                    obj.cover_image.url
-                )
+        if request:
+            return request.build_absolute_uri(
+                obj.cover_image.url
+            )
 
-            return obj.cover_image.url
+        return obj.cover_image.url
