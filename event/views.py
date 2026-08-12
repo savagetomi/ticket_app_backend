@@ -9,11 +9,14 @@ from user.permissions import IsHost  # adjust to match your actual app name
 from .models import Event
 from .permissions import IsEventOwnerOrReadOnly
 from .serializers import EventSerializer
+from rest_framework.parsers import MultiPartParser, FormParser
 
 
 class EventListCreateView(APIView):
 
     def get_permissions(self):
+        parser_classes = [MultiPartParser, FormParser]
+
         if self.request.method == 'POST':
             return [IsHost()]
         return [AllowAny()]
@@ -40,6 +43,9 @@ class EventListCreateView(APIView):
         }
     )
     def post(self, request):
+        print("REQUEST DATA:", request.data)
+        print("REQUEST FILES:", request.FILES)
+        
         serializer = EventSerializer(data=request.data)
         if serializer.is_valid():
             event = serializer.save(host=request.user)
@@ -55,6 +61,7 @@ class EventListCreateView(APIView):
 
 
 class EventDetailView(APIView):
+    parser_classes = [MultiPartParser, FormParser]
     permission_classes = [IsAuthenticatedOrReadOnly, IsEventOwnerOrReadOnly]
 
     def get_object(self, pk):
