@@ -5,7 +5,7 @@ from .models import Event
 class EventSerializer(serializers.ModelSerializer):
     host = serializers.CharField(source='host.username', read_only=True)
     is_sold_out = serializers.BooleanField(read_only=True)
-    cover_image = serializers.SerializerMethodField()
+    cover_image = serializers.ImageField(required=False, allow_null=True)
 
     class Meta:
         model = Event
@@ -17,15 +17,8 @@ class EventSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'host', 'created_at', 'updated_at']
 
-    def get_cover_image(self, obj):
-        request = self.context.get('request')
+    # def get_cover_image(self, obj):
+    #     if not obj.cover_image:
+    #         return None
 
-        if not obj.cover_image:
-            return None
-
-        if request:
-            return request.build_absolute_uri(
-                obj.cover_image.url
-            )
-
-        return obj.cover_image.url
+    #     return obj.cover_image.url
