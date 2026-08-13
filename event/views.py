@@ -13,10 +13,9 @@ from rest_framework.parsers import MultiPartParser, FormParser
 
 
 class EventListCreateView(APIView):
+    parser_classes = [MultiPartParser, FormParser]  # was a dead local var inside get_permissions
 
     def get_permissions(self):
-        parser_classes = [MultiPartParser, FormParser]
-
         if self.request.method == 'POST':
             return [IsHost()]
         return [AllowAny()]
@@ -28,8 +27,10 @@ class EventListCreateView(APIView):
         responses={200: EventSerializer(many=True)}
     )
     def get(self, request):
-        events = Event.objects.filter(status='draft')
-        return Response(EventSerializer(events, many=True).data)
+        events = Event.objects.filter(status='draft')  # NOTE: see caveat above — draft vs published
+        return Response(
+            EventSerializer(events, many=True, context={"request": request}).data
+        )
 
     @extend_schema(
         tags=['Events'],
@@ -43,9 +44,6 @@ class EventListCreateView(APIView):
         }
     )
     def post(self, request):
-        print("REQUEST DATA:", request.data)
-        print("REQUEST FILES:", request.FILES)
-        
         serializer = EventSerializer(data=request.data)
         if serializer.is_valid():
             event = serializer.save(host=request.user)
@@ -53,7 +51,7 @@ class EventListCreateView(APIView):
                 {
                     'success': True,
                     'message': 'Event created successfully',
-                    'event': EventSerializer(event).data,
+                    'event': EventSerializer(event, context={"request": request}).data,
                 },
                 status=status.HTTP_201_CREATED
             )
@@ -77,7 +75,8 @@ class EventDetailView(APIView):
     )
     def get(self, request, pk):
         event = self.get_object(pk)
-        return Response(EventSerializer(event).data)
+        serializer = EventSerializer(event, context={"request": request})
+        return Response(serializer.data)
 
     @extend_schema(
         tags=['Events'],
@@ -92,7 +91,7 @@ class EventDetailView(APIView):
     )
     def put(self, request, pk):
         event = self.get_object(pk)
-        serializer = EventSerializer(event, data=request.data)
+        serializer = EventSerializer(event, data=request.data, context={"request": request})
         if serializer.is_valid():
             serializer.save()
             return Response(
@@ -114,7 +113,7 @@ class EventDetailView(APIView):
     )
     def patch(self, request, pk):
         event = self.get_object(pk)
-        serializer = EventSerializer(event, data=request.data, partial=True)
+        serializer = EventSerializer(event, data=request.data, partial=True, context={"request": request})
         if serializer.is_valid():
             serializer.save()
             return Response(
@@ -146,4 +145,8 @@ class MyEventsView(APIView):
     )
     def get(self, request):
         events = Event.objects.filter(host=request.user)
-        return Response(EventSerializer(events, many=True).data)
+        return Response(
+            EventSerializer(events, many=True, context={"request": request}).data
+        )
+
+    # abeg nahhh
