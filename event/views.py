@@ -1,3 +1,5 @@
+from urllib import request
+
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticatedOrReadOnly
@@ -9,11 +11,11 @@ from user.permissions import IsHost  # adjust to match your actual app name
 from .models import Event
 from .permissions import IsEventOwnerOrReadOnly
 from .serializers import EventSerializer
-from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.parsers import MultiPartParser, FormParser,JSONParser
 
 
 class EventListCreateView(APIView):
-    parser_classes = [MultiPartParser, FormParser]  # was a dead local var inside get_permissions
+    parser_classes = [MultiPartParser, FormParser, JSONParser]  # was a dead local var inside get_permissions
 
     def get_permissions(self):
         if self.request.method == 'POST':
@@ -27,7 +29,7 @@ class EventListCreateView(APIView):
         responses={200: EventSerializer(many=True)}
     )
     def get(self, request):
-        events = Event.objects.filter(status='draft')  # NOTE: see caveat above — draft vs published
+        events = Event.objects.filter(status='published').order_by('-start_datetime')  # NOTE: see caveat above — draft vs published
         return Response(
             EventSerializer(events, many=True, context={"request": request}).data
         )
@@ -44,22 +46,38 @@ class EventListCreateView(APIView):
         }
     )
     def post(self, request):
+        print("REQUEST DATA:", request.data)
+        print("REQUEST FILES:", request.FILES)
+
         serializer = EventSerializer(data=request.data)
+
         if serializer.is_valid():
             event = serializer.save(host=request.user)
+
+            print("SAVED IMAGE:", event.cover_image.name)
+
             return Response(
                 {
                     'success': True,
                     'message': 'Event created successfully',
-                    'event': EventSerializer(event, context={"request": request}).data,
+                    'event': EventSerializer(
+                        event,
+                        context={"request": request}
+                    ).data,
                 },
                 status=status.HTTP_201_CREATED
             )
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        print("SERIALIZER ERRORS:", serializer.errors)
+
+        return Response(
+            serializer.errors,
+            status=status.HTTP_400_BAD_REQUEST
+        )
 
 
 class EventDetailView(APIView):
-    parser_classes = [MultiPartParser, FormParser]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
     permission_classes = [IsAuthenticatedOrReadOnly, IsEventOwnerOrReadOnly]
 
     def get_object(self, pk):
@@ -148,5 +166,3 @@ class MyEventsView(APIView):
         return Response(
             EventSerializer(events, many=True, context={"request": request}).data
         )
-
-    # abeg nahhh
