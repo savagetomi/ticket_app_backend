@@ -85,6 +85,7 @@ class TicketSerializer(serializers.ModelSerializer):
             'ticket_type_name',
 
             'event_title',
+            'event_description',
             'event_start_datetime',
             'event_end_datetime',
             'event_venue_name',
