@@ -19,18 +19,86 @@ class TicketTypeSerializer(serializers.ModelSerializer):
 
 
 class TicketSerializer(serializers.ModelSerializer):
-    event_title = serializers.CharField(source='ticket_type.event.title', read_only=True)
-    ticket_type_name = serializers.CharField(source='ticket_type.name', read_only=True)
-    price = serializers.DecimalField(source='ticket_type.price', max_digits=10, decimal_places=2, read_only=True)
+    event_title = serializers.CharField(
+        source='ticket_type.event.title',
+        read_only=True
+    )
+
+    event_start_datetime = serializers.DateTimeField(
+        source='ticket_type.event.start_datetime',
+        read_only=True
+    )
+
+    event_end_datetime = serializers.DateTimeField(
+        source='ticket_type.event.end_datetime',
+        read_only=True
+    )
+
+    event_venue_name = serializers.CharField(
+        source='ticket_type.event.venue_name',
+        read_only=True
+    )
+
+    event_address = serializers.CharField(
+        source='ticket_type.event.address',
+        read_only=True
+    )
+
+    event_city = serializers.CharField(
+        source='ticket_type.event.city',
+        read_only=True
+    )
+
+    event_state = serializers.CharField(
+        source='ticket_type.event.state',
+        read_only=True
+    )
+
+    event_country = serializers.CharField(
+        source='ticket_type.event.country',
+        read_only=True
+    )
+
+    ticket_type_name = serializers.CharField(
+        source='ticket_type.name',
+        read_only=True
+    )
+
+    price = serializers.DecimalField(
+        source='ticket_type.price',
+        max_digits=10,
+        decimal_places=2,
+        read_only=True
+    )
 
     class Meta:
         model = Ticket
         fields = [
-            'id', 'ticket_code', 'ticket_type', 'ticket_type_name',
-            'event_title', 'price', 'user', 'status', 'purchased_at',
-            'updated_at', 'checked_in_at',
+            'id',
+            'ticket_code',
+
+            'ticket_type',
+            'ticket_type_name',
+
+            'event_title',
+            'event_start_datetime',
+            'event_end_datetime',
+            'event_venue_name',
+            'event_address',
+            'event_city',
+            'event_state',
+            'event_country',
+
+            'price',
+
+            'user',
+            'status',
+            'purchased_at',
+            'updated_at',
+            'checked_in_at',
         ]
-        read_only_fields = fields  # entirely system-generated, never client-writable
+
+        read_only_fields = fields
 
 
 class PurchaseTicketSerializer(serializers.Serializer):
