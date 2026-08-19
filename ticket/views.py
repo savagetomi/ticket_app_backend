@@ -56,11 +56,15 @@ class TicketTypeListCreateView(APIView):
                 {
                     'success': True,
                     'message': 'Ticket type created successfully',
-                    'ticket_type': TicketTypeSerializer(ticket_type).data,
+                    'data': TicketTypeSerializer(ticket_type).data,
                 },
                 status=status.HTTP_201_CREATED
             )
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        return Response({
+            'success': False,
+            'message': 'Invalid data provided',
+            'errors': serializer.errors
+        }, status=status.HTTP_400_BAD_REQUEST)
 
 
 class TicketPurchaseView(APIView):
@@ -84,7 +88,7 @@ class TicketPurchaseView(APIView):
                 {
                     'success': True,
                     'message': f'{len(tickets)} ticket(s) purchased successfully',
-                    'tickets': TicketSerializer(tickets, many=True).data,
+                    'data': TicketSerializer(tickets, many=True).data,
                 },
                 status=status.HTTP_201_CREATED
             )
@@ -101,7 +105,7 @@ class MyTicketsView(APIView):
         responses={200: TicketSerializer(many=True)}
     )
     def get(self, request):
-        tickets = Ticket.objects.filter(user=request.user)
+        tickets = Ticket.objects.filter(user=request.user).select_related('ticket_type__event')
         return Response(TicketSerializer(tickets, many=True).data)
 
 
@@ -122,7 +126,7 @@ class TicketCheckInView(APIView):
                 fields={
                     'success': drf_serializers.BooleanField(),
                     'message': drf_serializers.CharField(),
-                    'ticket': TicketSerializer(),
+                    'data': TicketSerializer(),
                 }
             ),
             400: inline_serializer(
@@ -167,6 +171,6 @@ class TicketCheckInView(APIView):
         ticket.save(update_fields=['status', 'checked_in_at'])
 
         return Response(
-            {'success': True, 'message': 'Ticket checked in successfully.', 'ticket': TicketSerializer(ticket).data},
+            {'success': True, 'message': 'Ticket checked in successfully.', 'data': TicketSerializer(ticket).data},
             status=status.HTTP_200_OK
         )
