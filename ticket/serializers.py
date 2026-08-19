@@ -23,6 +23,10 @@ class TicketSerializer(serializers.ModelSerializer):
         source='ticket_type.event.title',
         read_only=True
     )
+    event_description = serializers.CharField(
+        source='ticket_type.event.description',
+        read_only=True
+    )
 
     event_start_datetime = serializers.DateTimeField(
         source='ticket_type.event.start_datetime',
