@@ -1,4 +1,5 @@
 import random
+import secrets
 import string
 import uuid
 
@@ -6,6 +7,15 @@ from django.conf import settings
 from django.db import models
 
 from event.models import Event
+
+def generate_ticket_code():
+    """TKT-XXXXXXXX — 8 chars from a 32-char alphabet (O/0/I/1 excluded for
+    readability). secrets, not random, because this code doubles as an
+    entry credential — it needs to be unguessable, not just unique."""
+    alphabet = string.ascii_uppercase + string.digits
+    alphabet = alphabet.translate(str.maketrans('', '', 'O0I1'))
+    suffix = ''.join(secrets.choice(alphabet) for _ in range(12))
+    return f'TKT-{suffix}'
 
 
 class TicketType(models.Model):
@@ -60,12 +70,10 @@ class Ticket(models.Model):
 
     def save(self, *args, **kwargs):
         if not self.ticket_code:
-            self.ticket_code = self._generate_unique_code()
+            code = generate_ticket_code()
+            # Collision odds are ~1 in 10^12 (32^8) — this loop is a formality,
+            # the DB-level unique constraint on ticket_code is the real backstop
+            while Ticket.objects.filter(ticket_code=code).exists():
+                code = generate_ticket_code()
+            self.ticket_code = code
         super().save(*args, **kwargs)
-
-    @staticmethod
-    def _generate_unique_code():
-        while True:
-            code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
-            if not Ticket.objects.filter(ticket_code=code).exists():
-                return code

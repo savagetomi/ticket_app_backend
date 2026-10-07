@@ -7,6 +7,8 @@ class EventSerializer(serializers.ModelSerializer):
     is_sold_out = serializers.BooleanField(read_only=True)
     cover_image = serializers.ImageField(required=False, allow_null=True)
 
+
+
     class Meta:
         model = Event
         fields = [
@@ -16,6 +18,21 @@ class EventSerializer(serializers.ModelSerializer):
             'status', 'is_sold_out', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'host', 'created_at', 'updated_at']
+
+
+    def validate(self, attrs):
+    latitude = attrs.get('latitude')
+    longitude = attrs.get('longitude')
+
+    status = attrs.get('status', getattr(self.instance, 'status', 'draft'))
+
+    if status == 'published':
+        if latitude is None or longitude is None:
+            raise serializers.ValidationError({
+                'location': 'Published events must have a valid latitude and longitude.'
+            })
+
+    return attrs
 
     # def get_cover_image(self, obj):
     #     if not obj.cover_image:
