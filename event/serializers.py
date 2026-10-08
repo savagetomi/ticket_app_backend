@@ -21,18 +21,16 @@ class EventSerializer(serializers.ModelSerializer):
 
 
     def validate(self, attrs):
-    latitude = attrs.get('latitude')
-    longitude = attrs.get('longitude')
+        latitude = attrs.get('latitude', getattr(self.instance, 'latitude', None))
+        longitude = attrs.get('longitude', getattr(self.instance, 'longitude', None))
+        event_status = attrs.get('status', getattr(self.instance, 'status', 'draft'))
 
-    status = attrs.get('status', getattr(self.instance, 'status', 'draft'))
-
-    if status == 'published':
-        if latitude is None or longitude is None:
+        if event_status == 'published' and (latitude is None or longitude is None):
             raise serializers.ValidationError({
                 'location': 'Published events must have a valid latitude and longitude.'
             })
 
-    return attrs
+        return attrs
 
     # def get_cover_image(self, obj):
     #     if not obj.cover_image:
