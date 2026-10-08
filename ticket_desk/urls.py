@@ -18,6 +18,7 @@ from django.conf.urls.static import static
 from django.contrib import admin
 from django.conf import settings
 from django.urls import path, include
+from event.views import NearbyEventsView
 from drf_spectacular.views import (
     SpectacularAPIView,
     SpectacularSwaggerView,
@@ -27,6 +28,7 @@ from drf_spectacular.views import (
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('events/nearby/', NearbyEventsView.as_view(), name='nearby-events'),
     path('auth/', include('user.urls')),
     path('event/', include('event.urls')),
     path('ticket/', include('ticket.urls')),

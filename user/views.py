@@ -1,24 +1,22 @@
 import logging
 from datetime import timedelta
-import user
 from utils.email import send_otp_email
 
 from django.contrib.auth import authenticate
-from django.core.mail import EmailMultiAlternatives, send_mail
-from django.template.loader import render_to_string
-from django.utils import timezone
+from django.db import transaction
 
 from drf_spectacular.utils import extend_schema, OpenApiResponse, inline_serializer
 from rest_framework import serializers, status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
+from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.serializers import TokenRefreshSerializer
 from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 
 from .models import CustomUser, OTP
-from .serializer import UserLoginSerializer, UserRegistrationSerializers, UserSerializer, UserUpdateSerializer
+from .serializer import UserRegistrationSerializers, UserSerializer, UserUpdateSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +24,7 @@ logger = logging.getLogger(__name__)
 class RegisterView(APIView):
 
     permission_classes = [AllowAny]
+    throttle_scope = 'auth_register'
 
     @extend_schema(
         tags=['Authentication'],
@@ -51,14 +50,6 @@ class RegisterView(APIView):
         }
     )
     
-    # def post(self, request):
-    #     print("=== REGISTER VIEW HIT ===")
-    #     print("User:", request.user)
-    #     print("Auth:", request.auth)
-
-    #     return Response({"message": "Reached register view"})
-
-
     def post(self, request):
         serializer = UserRegistrationSerializers(data=request.data)
         if serializer.is_valid():
@@ -66,8 +57,7 @@ class RegisterView(APIView):
             otp_obj, _ = OTP.objects.get_or_create(user=user)
             code = otp_obj.generate_code()
 
-            send_otp_email(user, code)    
-            refresh = RefreshToken.for_user(user)
+            send_otp_email(user, code)
             return Response({
                 'success': True,
                 'message': 'User registered successfully, Please verify your mail',
@@ -77,12 +67,12 @@ class RegisterView(APIView):
                 #     'access': str(refresh.access_token),
                 # }
             }, status=status.HTTP_201_CREATED)
-        print(serializer.errors) 
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
 class LoginView(APIView):
     permission_classes = [AllowAny]
+    throttle_scope = 'auth_login'
 
     @extend_schema(
         tags=['Authentication'],
@@ -200,6 +190,16 @@ class LogoutView(APIView):
 
         try:
             token = RefreshToken(refresh_token)
+            # A valid refresh token is not sufficient: callers may only
+            # revoke their own session, never another account's session.
+            if str(token.get('user_id')) != str(request.user.pk):
+                return Response(
+                    {
+                        "success": False,
+                        "message": "Invalid or expired refresh token.",
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             token.blacklist()
 
             return Response(
@@ -319,11 +319,12 @@ class ProfileView(APIView):
 
         # Revoke every outstanding refresh token so old sessions can't refresh
         # their way back to a live access token after deactivation.
-        for token in OutstandingToken.objects.filter(user=request.user):
-            BlacklistedToken.objects.get_or_create(token=token)
+        with transaction.atomic():
+            for token in OutstandingToken.objects.filter(user=request.user):
+                BlacklistedToken.objects.get_or_create(token=token)
 
-        request.user.is_active = False
-        request.user.save()
+            request.user.is_active = False
+            request.user.save(update_fields=['is_active'])
 
         return Response({'message': 'Account deactivated successfully'}, status=status.HTTP_200_OK)
 
@@ -332,6 +333,7 @@ class VerifyOTPView(APIView):
     """
     Handles verification of the submitted OTP code, checking for expiration.
     """
+    throttle_scope = 'otp_verify'
 
     @extend_schema(
         tags=['OTP'],
@@ -394,23 +396,21 @@ class VerifyOTPView(APIView):
         try:
 
             user = CustomUser.objects.get(email_address=email)
+            # Verified accounts authenticate through login, never through an
+            # anonymously requested OTP. This prevents OTP issuance from
+            # becoming a password-reset/account-takeover path.
+            if user.email_verified:
+                return Response(
+                    {'success': False, 'message': 'Invalid verification request.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
 
 
         except CustomUser.DoesNotExist:
-
             return Response(
-
-                {
-
-                    "success": False,
-
-                    "message": "User not found."
-
-                },
-
-                status=status.HTTP_404_NOT_FOUND,
-
+                {"success": False, "message": "Invalid verification request."},
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
 
@@ -422,82 +422,28 @@ class VerifyOTPView(APIView):
 
 
         except OTP.DoesNotExist:
-
             return Response(
-
-                {
-
-                    "success": False,
-
-                    "message": "No OTP found. Please request a new OTP."
-
-                },
-
-                status=status.HTTP_404_NOT_FOUND,
-
-            )
-
-
-
-        # Check expiration
-
-        if not otp.is_valid():
-
-
-
-            otp.delete()
-
-
-
-            return Response(
-
-                {
-
-                    "success": False,
-
-                    "message": "OTP has expired. Please request another one."
-
-                },
-
+                {"success": False, "message": "Invalid verification request."},
                 status=status.HTTP_400_BAD_REQUEST,
-
             )
 
+        # This locks the row, handles expiry cleanup, records failures, and
+        # atomically consumes a correct code. Keep the account state update in
+        # the same outer transaction so a successful code cannot be consumed
+        # without also marking the account verified.
+        with transaction.atomic():
+            if not otp.verify_code(otp_code):
+                return Response(
+                    {"success": False, "message": "Invalid verification request."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
-
-        # Check code
-
-        if otp.otp_code != otp_code:
-
-
-
-            return Response(
-
-                {
-
-                    "success": False,
-
-                    "message": "Invalid OTP."
-
-                },
-
-                status=status.HTTP_400_BAD_REQUEST,
-
-            )
+            user.email_verified = True
+            user.save(update_fields=["email_verified"])
 
 
 
-        # Verify account
-
-        user.email_verified = True
-
-        user.save(update_fields=["email_verified"])
-
-
-
-        # Delete OTP so it can't be reused
-
-        otp.delete()
+        # verify_code() consumed the OTP while holding its database row lock.
 
 
 
@@ -532,7 +478,9 @@ class ResendOTPView(APIView):
     including rate limiting.
     """
     # Set the minimum wait time for clarity and easy modification
-    MIN_RESEND_WAIT = timedelta(minutes=2) 
+    MIN_RESEND_WAIT = timedelta(minutes=2)
+    throttle_scope = 'otp_request'
+    GENERIC_MESSAGE = 'If verification is required, a code has been sent.'
 
     @extend_schema(
         tags=['OTP'],
@@ -571,99 +519,47 @@ class ResendOTPView(APIView):
     )
     def post(self, request):
         email = request.data.get('email_address')
-        
-        # 1. Basic Input Check
+
         if not email:
             return Response(
-                {'message': "Email address is required.", 'success': False}, 
-                status=status.HTTP_400_BAD_REQUEST
+                {'message': 'Email address is required.', 'success': False},
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         try:
-            # 2. Lookup User and OTP Object
             user = CustomUser.objects.get(email_address=email)
-            otp_obj, created = OTP.objects.get_or_create(user=user)
-
-            # Prevent resending if the user is already verified
             if user.email_verified:
-                return Response(
-                    {'message': "Account is already verified.", 'success': False},
-                    status=status.HTTP_409_CONFLICT
-                )
+                return Response({'message': self.GENERIC_MESSAGE, 'success': True})
 
-            # 3. CRITICAL: RATE LIMITING (Anti-Spam)
-            # This logic is sound: Check if the current time minus the creation time is less than the limit.
-            if not created and (timezone.now() - otp_obj.otp_last_generated) < self.MIN_RESEND_WAIT:
-                wait_time_seconds = int((self.MIN_RESEND_WAIT - (timezone.now() - otp_obj.otp_last_generated)).total_seconds())
-                
-                # Format the wait time nicely for the user (e.g., "60 seconds")
-                message = f"Please wait {wait_time_seconds} seconds before resending the code."
-                if wait_time_seconds > 60:
-                    message = f"Please wait {wait_time_seconds // 60} minute(s) and {wait_time_seconds % 60} seconds before resending."
-                    
-                return Response(
-                    {'message': message, 'success': False},
-                    status=status.HTTP_429_TOO_MANY_REQUESTS
-                )
-            
-            # 4. Generate NEW Code and Expiry 
-            # This uses the correct, zero-padded, time-setting method in the OTP model
-            new_otp_code = otp_obj.generate_code()
+            # The helper locks the one-to-one OTP row before inspecting the
+            # resend window or replacing its hash. Email is sent only after
+            # that transaction has committed.
+            new_otp_code, outcome = OTP.issue_code_for_user(
+                user, min_resend_wait=self.MIN_RESEND_WAIT
+            )
 
         except CustomUser.DoesNotExist:
-            return Response(
-                {'message': "User not found with this email.", 'success': False}, 
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({'message': self.GENERIC_MESSAGE, 'success': True})
         except Exception:
-            logger.exception("Error during OTP generation")
-            return Response(
-                {'message': "An internal error occurred. Please try again later.", 'success': False},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            logger.exception('Failed to prepare resend OTP')
+            return Response({'message': self.GENERIC_MESSAGE, 'success': True})
 
-        # --- 5. Send NEW Email ---
-        subject = 'New Verification Code'
-        from_email = 'dhareykhaey3@gmail.com'
-        
-        # Use user.email_address for the recipient since that's what you used for lookup
-        to = [user.email_address] 
+        if outcome != 'issued':
+            return Response({'message': self.GENERIC_MESSAGE, 'success': True})
 
-        context = {
-            # Use user.email_address for consistency, assuming this is the primary email field
-            "username": user.email_address, 
-            "otp_code": new_otp_code,
-        }
-        
-        html_content = render_to_string("user/otp_message.html", context)
-        text_content = f"Your new verification code is: {new_otp_code}"
-        
-        # Improved EmailMultiAlternatives instantiation (using keywords is clearer)
-        msg = EmailMultiAlternatives(
-            subject=subject, 
-            body=text_content, 
-            from_email=from_email, 
-            to=to
-        )
-        msg.attach_alternative(html_content, "text/html")
-        
         try:
-            msg.send()
-            return Response(
-                {'message': "New OTP has been sent.", 'success': True}, 
-                status=status.HTTP_200_OK
-            )
+            send_otp_email(user, new_otp_code)
         except Exception:
-            # If the email failed, the OTP is still valid in the DB, but the user didn't get it.
-            # It's safest to return a 500 here, as the user must receive the code.
-            logger.exception("Failed to send resend-OTP email")
-            return Response(
-                {'message': "OTP updated, but email service failed to send the message.", 'success': False}, 
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            logger.exception('Failed to send resend OTP email')
+
+        return Response({'message': self.GENERIC_MESSAGE, 'success': True})
 
 
 class GenerateOTPView(APIView):
+
+    MIN_RESEND_WAIT = timedelta(minutes=2)
+    throttle_scope = 'otp_request'
+    GENERIC_MESSAGE = 'If verification is required, a code has been sent.'
 
     @extend_schema(
         tags=['OTP'],
@@ -694,42 +590,31 @@ class GenerateOTPView(APIView):
 
         try:
             user = CustomUser.objects.get(email_address=email)
+            if user.email_verified:
+                return Response({'success': True, 'message': self.GENERIC_MESSAGE})
 
-            otp_obj, _ = OTP.objects.get_or_create(user=user)
-            code = otp_obj.generate_code()
-
-            send_otp_email(user, code)
-
-            return Response(
-                {
-                    "success": True,
-                    "message": f"OTP sent to {email}"
-                },
-                status=status.HTTP_200_OK
+            code, outcome = OTP.issue_code_for_user(
+                user, min_resend_wait=self.MIN_RESEND_WAIT
             )
+            if outcome == 'issued':
+                try:
+                    # issue_code_for_user has already committed its row lock.
+                    send_otp_email(user, code)
+                except Exception:
+                    logger.exception('Failed to send generated OTP email')
+
+            return Response({'success': True, 'message': self.GENERIC_MESSAGE})
 
         except CustomUser.DoesNotExist:
-            return Response(
-                {
-                    "success": False,
-                    "message": "User not found"
-                },
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({'success': True, 'message': self.GENERIC_MESSAGE})
 
-        except Exception as e:
-            logger.exception(e)
-
-            return Response(
-                {
-                    "success": False,
-                    "message": str(e)
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        except Exception:
+            logger.exception("Failed to generate verification OTP")
+            return Response({'success': True, 'message': self.GENERIC_MESSAGE})
 
 class RefreshTokenView(APIView):
     permission_classes = [AllowAny]
+    throttle_scope = 'token_refresh'
 
     @extend_schema(
         tags=['Authentication'],

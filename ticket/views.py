@@ -1,3 +1,5 @@
+from django.db import transaction
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import serializers as drf_serializers, status
@@ -22,11 +24,16 @@ class TicketTypeListCreateView(APIView):
     @extend_schema(
         tags=['Tickets'],
         summary="List ticket types for an event",
-        description="Returns all ticket types (e.g. VIP, Regular) defined for the given event. Public.",
+        description="Public for published events; hosts may also list ticket types for their own non-public events.",
         responses={200: TicketTypeSerializer(many=True)}
     )
     def get(self, request, event_id):
-        get_object_or_404(Event, id=event_id)
+        events = Event.objects.filter(id=event_id)
+        if request.user.is_authenticated:
+            events = events.filter(Q(status='published') | Q(host=request.user))
+        else:
+            events = events.filter(status='published')
+        get_object_or_404(events)
         ticket_types = TicketType.objects.filter(event_id=event_id)
         return Response(TicketTypeSerializer(ticket_types, many=True).data)
 
@@ -83,7 +90,17 @@ class TicketPurchaseView(APIView):
     def post(self, request):
         serializer = PurchaseTicketSerializer(data=request.data, context={'request': request})
         if serializer.is_valid():
-            tickets = serializer.save()
+            try:
+                tickets = serializer.save()
+            except drf_serializers.ValidationError as exc:
+                return Response(
+                    {
+                        'success': False,
+                        'message': 'Tickets are no longer available for purchase.',
+                        'errors': exc.detail,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             return Response(
                 {
                     'success': True,
@@ -153,26 +170,48 @@ class TicketCheckInView(APIView):
         if not ticket_code:
             return Response({'success': False, 'message': 'ticket_code is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        try:
-            ticket = Ticket.objects.select_related('ticket_type__event').get(ticket_code=ticket_code)
-        except Ticket.DoesNotExist:
-            return Response({'success': False, 'message': 'Ticket not found.'}, status=status.HTTP_404_NOT_FOUND)
+        with transaction.atomic():
+            try:
+                # Lock the credential first so two gate devices cannot both
+                # admit it. Filtering by host also avoids cross-event leakage.
+                ticket = Ticket.objects.select_for_update().select_related('ticket_type').get(
+                    ticket_code=ticket_code,
+                    ticket_type__event__host=request.user,
+                )
+            except Ticket.DoesNotExist:
+                return Response(
+                    {'success': False, 'message': 'Ticket not available.'},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
 
-        if ticket.ticket_type.event.host_id != request.user.id:
-            return Response(
-                {'success': False, 'message': "This ticket belongs to another host's event."},
-                status=status.HTTP_403_FORBIDDEN
-            )
+            # Lock the event too, so a cancellation or time-window update
+            # cannot race the lifecycle check below.
+            event = Event.objects.select_for_update().get(pk=ticket.ticket_type.event_id)
+            now = timezone.now()
+            if event.status != 'published':
+                return Response(
+                    {'success': False, 'message': 'Check-in is not available for this event.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if now < event.start_datetime or now > event.end_datetime:
+                return Response(
+                    {'success': False, 'message': 'Check-in is not currently open for this event.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if ticket.status != 'valid':
+                message = (
+                    'This ticket has already been checked in.'
+                    if ticket.status == 'used'
+                    else 'This ticket is no longer valid.'
+                )
+                return Response(
+                    {'success': False, 'message': message},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
-        if ticket.status == 'used':
-            return Response({'success': False, 'message': 'This ticket has already been checked in.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        if ticket.status == 'cancelled':
-            return Response({'success': False, 'message': 'This ticket has been cancelled.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        ticket.status = 'used'
-        ticket.checked_in_at = timezone.now()
-        ticket.save(update_fields=['status', 'checked_in_at'])
+            ticket.status = 'used'
+            ticket.checked_in_at = now
+            ticket.save(update_fields=['status', 'checked_in_at'])
 
         return Response(
             {'success': True, 'message': 'Ticket checked in successfully.', 'data': TicketSerializer(ticket).data},

@@ -1,4 +1,5 @@
 from django.db import transaction
+from django.utils import timezone
 from rest_framework import serializers
 
 from .models import Ticket, TicketType
@@ -16,6 +17,15 @@ class TicketTypeSerializer(serializers.ModelSerializer):
             'is_sold_out', 'sales_start', 'sales_end', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'event', 'quantity_sold', 'created_at', 'updated_at']
+
+    def validate(self, attrs):
+        sales_start = attrs.get('sales_start', getattr(self.instance, 'sales_start', None))
+        sales_end = attrs.get('sales_end', getattr(self.instance, 'sales_end', None))
+        if sales_start and sales_end and sales_end <= sales_start:
+            raise serializers.ValidationError(
+                {'sales_end': 'Sales must end after they start.'}
+            )
+        return attrs
 
 
 class TicketSerializer(serializers.ModelSerializer):
@@ -107,8 +117,28 @@ class TicketSerializer(serializers.ModelSerializer):
 
 
 class PurchaseTicketSerializer(serializers.Serializer):
+    MAX_TICKETS_PER_ORDER = 10
+
     ticket_type = serializers.UUIDField()
-    quantity = serializers.IntegerField(min_value=1)
+    quantity = serializers.IntegerField(min_value=1, max_value=MAX_TICKETS_PER_ORDER)
+
+    @staticmethod
+    def _validate_sale_is_open(ticket_type):
+        event = ticket_type.event
+        now = timezone.now()
+
+        if event.status != 'published':
+            raise serializers.ValidationError(
+                {'ticket_type': 'Tickets are not available for this event.'}
+            )
+        if ticket_type.sales_start and now < ticket_type.sales_start:
+            raise serializers.ValidationError(
+                {'ticket_type': 'Ticket sales have not started yet.'}
+            )
+        if ticket_type.sales_end and now > ticket_type.sales_end:
+            raise serializers.ValidationError(
+                {'ticket_type': 'Ticket sales have ended.'}
+            )
 
     def validate_ticket_type(self, value):
         if not TicketType.objects.filter(id=value).exists():
@@ -117,7 +147,8 @@ class PurchaseTicketSerializer(serializers.Serializer):
 
     def validate(self, attrs):
         # Fast, friendly upfront check. Not the authoritative one — see create().
-        ticket_type = TicketType.objects.get(id=attrs['ticket_type'])
+        ticket_type = TicketType.objects.select_related('event').get(id=attrs['ticket_type'])
+        self._validate_sale_is_open(ticket_type)
         if ticket_type.quantity_remaining < attrs['quantity']:
             raise serializers.ValidationError(
                 {"quantity": f"Only {ticket_type.quantity_remaining} ticket(s) left for '{ticket_type.name}'."}
@@ -132,8 +163,14 @@ class PurchaseTicketSerializer(serializers.Serializer):
         # quantity_sold, and correctly fails instead of both succeeding
         # (which would oversell the event). Note: this only actually locks on
         # Postgres/MySQL — it's a silent no-op on SQLite.
-        ticket_type = TicketType.objects.select_for_update().get(id=validated_data['ticket_type'])
+        ticket_type = TicketType.objects.select_for_update().select_related('event').get(
+            id=validated_data['ticket_type']
+        )
         quantity = validated_data['quantity']
+
+        # Re-check after locking so a sale closing or event state change cannot
+        # be bypassed between serializer validation and ticket creation.
+        self._validate_sale_is_open(ticket_type)
 
         if ticket_type.quantity_remaining < quantity:
             raise serializers.ValidationError(

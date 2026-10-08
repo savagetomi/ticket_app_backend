@@ -8,10 +8,17 @@ class UserRegistrationSerializers(serializers.ModelSerializer):
     password = serializers.CharField(min_length=8, write_only=True)
     confirm_password = serializers.CharField( write_only=True)
     username = serializers.CharField(required=False)
+    # Self-service sign-up intentionally permits hosts for this test product,
+    # but it must never grant an administrative role from client input.
+    roles = serializers.ChoiceField(
+        choices=[('user', 'User'), ('host', 'Host')],
+        required=False,
+        default='user',
+    )
 
     class Meta:
         model = CustomUser
-        fields = ["first_name","last_name","email_address","username","phone_number","username","password","confirm_password", "roles"] 
+        fields = ["first_name", "last_name", "email_address", "username", "phone_number", "password", "confirm_password", "roles"]
 
     def validate_email_address(self, value):
         if CustomUser.objects.filter(email_address=value).exists():

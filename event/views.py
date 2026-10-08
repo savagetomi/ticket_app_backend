@@ -1,6 +1,10 @@
-from urllib import request
+import math
 
+from django.core.paginator import EmptyPage, Paginator
+from django.db.models import ExpressionWrapper, F, FloatField, Q, Value
+from django.db.models.functions import ASin, Cos, Greatest, Least, Radians, Sin, Sqrt
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticatedOrReadOnly
 from rest_framework.response import Response
@@ -10,8 +14,188 @@ from drf_spectacular.utils import extend_schema, OpenApiResponse
 from user.permissions import IsHost  # adjust to match your actual app name
 from .models import Event
 from .permissions import IsEventOwnerOrReadOnly
-from .serializers import EventSerializer
+from .serializers import EventSerializer, NearbyEventQuerySerializer, NearbyEventSerializer
 from rest_framework.parsers import MultiPartParser, FormParser,JSONParser
+
+
+class NearbyEventsView(APIView):
+    """Return a bounded, public list of active events near a coordinate."""
+
+    permission_classes = [AllowAny]
+    throttle_scope = 'nearby_events'
+
+    EARTH_RADIUS_KM = 6371.0088
+    PAGE_SIZE = 10
+
+    @staticmethod
+    def _distance_expression(latitude, longitude):
+        """Haversine distance in kilometres, calculated by the database."""
+        float_value = lambda value: Value(value, output_field=FloatField())
+        query_latitude = float_value(math.radians(latitude))
+        query_longitude = float_value(math.radians(longitude))
+        half = float_value(0.5)
+
+        latitude_delta = Radians(F('latitude')) - query_latitude
+        longitude_delta = Radians(F('longitude')) - query_longitude
+        latitude_component = Sin(latitude_delta * half) * Sin(latitude_delta * half)
+        longitude_component = Sin(longitude_delta * half) * Sin(longitude_delta * half)
+        haversine = ExpressionWrapper(
+            latitude_component
+            + Cos(query_latitude) * Cos(Radians(F('latitude'))) * longitude_component,
+            output_field=FloatField(),
+        )
+        # Floating-point rounding can make values just outside [0, 1]. Clamp
+        # before ASin/Sqrt so same-point and edge coordinates cannot raise a
+        # database math-domain error.
+        clamped_haversine = Greatest(
+            float_value(0.0),
+            Least(float_value(1.0), haversine),
+        )
+        return ExpressionWrapper(
+            float_value(2 * NearbyEventsView.EARTH_RADIUS_KM)
+            * ASin(Sqrt(clamped_haversine)),
+            output_field=FloatField(),
+        )
+
+    @staticmethod
+    def _bounded_candidates(latitude, longitude, radius_km):
+        """Coarsely restrict rows before applying the exact Haversine filter."""
+        latitude_delta = radius_km / 111.32
+        cosine_latitude = abs(math.cos(math.radians(latitude)))
+        longitude_delta = (
+            180
+            if cosine_latitude < 1e-12
+            else min(180, radius_km / (111.32 * cosine_latitude))
+        )
+
+        events = Event.objects.filter(
+            status='published',
+            end_datetime__gte=timezone.now(),
+            latitude__isnull=False,
+            longitude__isnull=False,
+            latitude__gte=max(-90, latitude - latitude_delta),
+            latitude__lte=min(90, latitude + latitude_delta),
+            longitude__gte=-180,
+            longitude__lte=180,
+        )
+
+        minimum_longitude = longitude - longitude_delta
+        maximum_longitude = longitude + longitude_delta
+        if longitude_delta >= 180:
+            return events
+        if minimum_longitude < -180:
+            return events.filter(
+                Q(longitude__gte=minimum_longitude + 360)
+                | Q(longitude__lte=maximum_longitude)
+            )
+        if maximum_longitude > 180:
+            return events.filter(
+                Q(longitude__gte=minimum_longitude)
+                | Q(longitude__lte=maximum_longitude - 360)
+            )
+        return events.filter(
+            longitude__gte=minimum_longitude,
+            longitude__lte=maximum_longitude,
+        )
+
+    @extend_schema(
+        tags=['Events'],
+        summary='Find nearby events',
+        description=(
+            'Public. Supply latitude and longitude plus an optional radius_km '
+            '(or radius) of 5, 10, 20, or 30 and an optional page (1-1000). '
+            'Returns up to 10 published, ongoing or upcoming events per '
+            'page, ordered by distance.'
+        ),
+        responses={
+            200: OpenApiResponse(description='Nearby events returned.'),
+            400: OpenApiResponse(description='Invalid coordinate or radius.'),
+            404: OpenApiResponse(description='Requested page does not exist.'),
+            429: OpenApiResponse(description='Rate limit exceeded.'),
+        },
+    )
+    def get(self, request):
+        allowed_parameters = {'latitude', 'longitude', 'radius_km', 'radius', 'page'}
+        unsupported_parameters = set(request.query_params) - allowed_parameters
+        if unsupported_parameters:
+            return Response(
+                {
+                    name: ['This query parameter is not supported.']
+                    for name in sorted(unsupported_parameters)
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        for name in ('latitude', 'longitude', 'radius_km', 'radius', 'page'):
+            if len(request.query_params.getlist(name)) > 1:
+                return Response(
+                    {name: ['Provide this query parameter only once.']},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        if 'radius_km' in request.query_params and 'radius' in request.query_params:
+            return Response(
+                {'radius_km': ['Use either radius_km or radius, not both.']},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        parameters = request.query_params.copy()
+        if 'radius' in parameters:
+            parameters['radius_km'] = parameters['radius']
+        query = NearbyEventQuerySerializer(data=parameters)
+        if not query.is_valid():
+            return Response(query.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        latitude = query.validated_data['latitude']
+        longitude = query.validated_data['longitude']
+        radius_km = query.validated_data['radius_km']
+        page_number = query.validated_data['page']
+        distance_expression = self._distance_expression(latitude, longitude)
+        events = (
+            self._bounded_candidates(latitude, longitude, radius_km)
+            .annotate(distance_km=distance_expression)
+            .filter(distance_km__lte=radius_km)
+            .order_by('distance_km', 'start_datetime', 'id')
+        )
+        paginator = Paginator(events, self.PAGE_SIZE)
+        try:
+            event_page = paginator.page(page_number)
+        except EmptyPage:
+            return Response(
+                {'detail': 'Invalid page.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        results = NearbyEventSerializer(
+            event_page.object_list,
+            many=True,
+            context={'request': request},
+        ).data
+        for result in results:
+            result['distance_km'] = round(result['distance_km'], 2)
+
+        return Response(
+            {
+                'success': True,
+                'radius_km': radius_km,
+                'count': paginator.count,
+                'pagination': {
+                    'page': event_page.number,
+                    'page_size': self.PAGE_SIZE,
+                    'total_pages': paginator.num_pages,
+                    'total_results': paginator.count,
+                    'has_next': event_page.has_next(),
+                    'has_previous': event_page.has_previous(),
+                    'next_page': event_page.next_page_number() if event_page.has_next() else None,
+                    'previous_page': (
+                        event_page.previous_page_number()
+                        if event_page.has_previous()
+                        else None
+                    ),
+                },
+                'results': results,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class EventListCreateView(APIView):
@@ -46,15 +230,10 @@ class EventListCreateView(APIView):
         }
     )
     def post(self, request):
-        print("REQUEST DATA:", request.data)
-        print("REQUEST FILES:", request.FILES)
-
         serializer = EventSerializer(data=request.data)
 
         if serializer.is_valid():
             event = serializer.save(host=request.user)
-
-            print("SAVED IMAGE:", event.cover_image.name)
 
             return Response(
                 {
@@ -68,8 +247,6 @@ class EventListCreateView(APIView):
                 status=status.HTTP_201_CREATED
             )
 
-        print("SERIALIZER ERRORS:", serializer.errors)
-
         return Response(
             serializer.errors,
             status=status.HTTP_400_BAD_REQUEST
@@ -81,14 +258,21 @@ class EventDetailView(APIView):
     permission_classes = [IsAuthenticatedOrReadOnly, IsEventOwnerOrReadOnly]
 
     def get_object(self, pk):
-        event = get_object_or_404(Event, pk=pk)
+        # Draft/cancelled event metadata is visible only to its host. The
+        # public detail endpoint must mirror the public list endpoint.
+        events = Event.objects.filter(pk=pk)
+        if self.request.user.is_authenticated:
+            events = events.filter(Q(status='published') | Q(host=self.request.user))
+        else:
+            events = events.filter(status='published')
+        event = get_object_or_404(events)
         self.check_object_permissions(self.request, event)
         return event
 
     @extend_schema(
         tags=['Events'],
         summary="Retrieve a single event",
-        description="Public.",
+        description="Public for published events; hosts may also retrieve their own non-public events.",
         responses={200: EventSerializer}
     )
     def get(self, request, pk):
@@ -148,6 +332,15 @@ class EventDetailView(APIView):
     )
     def delete(self, request, pk):
         event = self.get_object(pk)
+        # Do not cascade-delete issued admission credentials. Cancelling keeps
+        # the audit trail and is already enforced by purchase/check-in checks.
+        if event.ticket_types.filter(tickets__isnull=False).exists():
+            event.status = 'cancelled'
+            event.save(update_fields=['status'])
+            return Response(
+                {'success': True, 'message': 'Event cancelled because tickets have already been issued.'},
+                status=status.HTTP_200_OK,
+            )
         event.delete()
         return Response({'success': True, 'message': 'Event deleted successfully'}, status=status.HTTP_200_OK)
 

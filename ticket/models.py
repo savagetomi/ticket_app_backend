@@ -14,7 +14,7 @@ def generate_ticket_code():
     entry credential — it needs to be unguessable, not just unique."""
     alphabet = string.ascii_uppercase + string.digits
     alphabet = alphabet.translate(str.maketrans('', '', 'O0I1'))
-    suffix = ''.join(secrets.choice(alphabet) for _ in range(12))
+    suffix = ''.join(secrets.choice(alphabet) for _ in range(8))
     return f'TKT-{suffix}'
 
 

@@ -45,6 +45,25 @@ class Event(models.Model):
 
     class Meta:
         ordering = ['-start_datetime']
+        indexes = [
+            models.Index(fields=['status', 'latitude', 'longitude'], name='event_nearby_idx'),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(latitude__isnull=True, longitude__isnull=True)
+                    | models.Q(
+                        latitude__isnull=False,
+                        longitude__isnull=False,
+                        latitude__gte=-90,
+                        latitude__lte=90,
+                        longitude__gte=-180,
+                        longitude__lte=180,
+                    )
+                ),
+                name='event_valid_coordinates',
+            ),
+        ]
 
     def __str__(self):
         return f"{self.title} ({self.start_datetime.date()})"
