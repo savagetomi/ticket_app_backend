@@ -8,5 +8,6 @@ class IsEventOwnerOrReadOnly(BasePermission):
             return True
         return bool(
             request.user and request.user.is_authenticated
+            and getattr(request.user, 'is_active', False)
             and obj.host_id == request.user.id
         )

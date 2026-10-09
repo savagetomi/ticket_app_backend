@@ -146,7 +146,79 @@ class SessionSecurityTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.user.refresh_from_db()
         self.assertFalse(self.user.is_active)
+        self.assertTrue(CustomUser.objects.filter(pk=self.user.pk).exists())
         self.assertTrue(BlacklistedToken.objects.filter(token__user=self.user).exists())
+
+
+class AccountRecoveryTests(TestCase):
+    def setUp(self):
+        self.account = CustomUser.objects.create_user(
+            username='recoverable-user',
+            email_address='recoverable@example.com',
+            first_name='Recoverable',
+            last_name='User',
+            phone_number='08000000013',
+            password='SafePassword123!',
+            email_verified=True,
+        )
+        self.regular_user = CustomUser.objects.create_user(
+            username='non-admin-user',
+            email_address='non-admin@example.com',
+            first_name='Non',
+            last_name='Admin',
+            phone_number='08000000014',
+            password='SafePassword123!',
+            email_verified=True,
+        )
+        self.admin_user = CustomUser.objects.create_user(
+            username='account-admin',
+            email_address='account-admin@example.com',
+            first_name='Account',
+            last_name='Admin',
+            phone_number='08000000015',
+            password='SafePassword123!',
+            roles='admin',
+            is_staff=True,
+            email_verified=True,
+        )
+        self.account.is_active = False
+        self.account.save(update_fields=['is_active'])
+
+    def test_deactivated_account_cannot_login_or_access_profile(self):
+        login_response = APIClient().post(
+            '/auth/login/',
+            {
+                'email_address': self.account.email_address,
+                'password': 'SafePassword123!',
+            },
+            format='json',
+        )
+        profile_client = APIClient()
+        profile_client.force_authenticate(self.account)
+        profile_response = profile_client.get('/auth/profile/')
+
+        self.assertEqual(login_response.status_code, 401)
+        self.assertEqual(profile_response.status_code, 403)
+
+    def test_only_account_administrator_can_inspect_and_reactivate(self):
+        detail_url = f'/auth/admin/users/{self.account.pk}/'
+        reactivate_url = f'/auth/admin/users/{self.account.pk}/reactivate/'
+        client = APIClient()
+        client.force_authenticate(self.regular_user)
+
+        denied = client.get(detail_url)
+        self.assertEqual(denied.status_code, 403)
+
+        client.force_authenticate(self.admin_user)
+        detail = client.get(detail_url)
+        reactivated = client.post(reactivate_url, format='json')
+
+        self.assertEqual(detail.status_code, 200)
+        self.assertFalse(detail.data['user']['is_active'])
+        self.assertNotIn('password', detail.data['user'])
+        self.assertEqual(reactivated.status_code, 200)
+        self.account.refresh_from_db()
+        self.assertTrue(self.account.is_active)
 
 
 class RegistrationRoleTests(TestCase):

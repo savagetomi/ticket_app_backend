@@ -3,13 +3,13 @@ from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import serializers as drf_serializers, status
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from drf_spectacular.utils import extend_schema, inline_serializer, OpenApiResponse
 
 from event.models import Event
-from user.permissions import IsHost  # adjust to match your actual app name
+from user.permissions import IsActiveAuthenticated, IsHost
 from .models import Ticket, TicketType
 from .serializers import PurchaseTicketSerializer, TicketSerializer, TicketTypeSerializer
 
@@ -24,15 +24,19 @@ class TicketTypeListCreateView(APIView):
     @extend_schema(
         tags=['Tickets'],
         summary="List ticket types for an event",
-        description="Public for published events; hosts may also list ticket types for their own non-public events.",
+        description=(
+            "Public for active, published events with more than one minute before "
+            "they start; hosts may also list ticket types for their own non-public events."
+        ),
         responses={200: TicketTypeSerializer(many=True)}
     )
     def get(self, request, event_id):
+        now = PurchaseTicketSerializer.refresh_event_lifecycle()
         events = Event.objects.filter(id=event_id)
         if request.user.is_authenticated:
-            events = events.filter(Q(status='published') | Q(host=request.user))
+            events = events.filter(Event.public_availability_filter(now) | Q(host=request.user))
         else:
-            events = events.filter(status='published')
+            events = events.filter(Event.public_availability_filter(now))
         get_object_or_404(events)
         ticket_types = TicketType.objects.filter(event_id=event_id)
         return Response(TicketTypeSerializer(ticket_types, many=True).data)
@@ -49,11 +53,20 @@ class TicketTypeListCreateView(APIView):
         }
     )
     def post(self, request, event_id):
-        event = get_object_or_404(Event, id=event_id)
+        now = PurchaseTicketSerializer.refresh_event_lifecycle()
+        event = get_object_or_404(Event.objects.select_related('host'), id=event_id)
         if event.host_id != request.user.id:
             return Response(
                 {'success': False, 'message': 'You can only add ticket types to your own events.'},
                 status=status.HTTP_403_FORBIDDEN
+            )
+        if not PurchaseTicketSerializer.event_allows_ticket_type_configuration(event, now):
+            return Response(
+                {
+                    'success': False,
+                    'message': 'Ticket types are not available for this event.',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         serializer = TicketTypeSerializer(data=request.data)
@@ -75,12 +88,12 @@ class TicketTypeListCreateView(APIView):
 
 
 class TicketPurchaseView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsActiveAuthenticated]
 
     @extend_schema(
         tags=['Tickets'],
         summary="Purchase tickets",
-        description="Buys `quantity` tickets of the given ticket type for the authenticated user. Fails if not enough tickets remain. NOTE: no payment gateway is wired in yet — this issues tickets immediately without charging anything.",
+        description="Buys `quantity` tickets of the given ticket type for the authenticated user. Sales close one minute before the event starts and are unavailable for inactive events or inactive hosts. Fails if not enough tickets remain. NOTE: no payment gateway is wired in yet — this issues tickets immediately without charging anything.",
         request=PurchaseTicketSerializer,
         responses={
             201: OpenApiResponse(description="Tickets purchased"),
@@ -117,7 +130,7 @@ class TicketPurchaseView(APIView):
 
 
 class MyTicketsView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsActiveAuthenticated]
 
     @extend_schema(
         tags=['Tickets'],

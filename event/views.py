@@ -6,12 +6,12 @@ from django.db.models.functions import ASin, Cos, Greatest, Least, Radians, Sin,
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.permissions import AllowAny, IsAuthenticatedOrReadOnly
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from drf_spectacular.utils import extend_schema, OpenApiResponse
 
-from user.permissions import IsHost  # adjust to match your actual app name
+from user.permissions import IsActiveAuthenticatedOrReadOnly, IsHost
 from .models import Event
 from .permissions import IsEventOwnerOrReadOnly
 from .serializers import EventSerializer, NearbyEventQuerySerializer, NearbyEventSerializer
@@ -58,7 +58,7 @@ class NearbyEventsView(APIView):
         )
 
     @staticmethod
-    def _bounded_candidates(latitude, longitude, radius_km):
+    def _bounded_candidates(latitude, longitude, radius_km, now):
         """Coarsely restrict rows before applying the exact Haversine filter."""
         latitude_delta = radius_km / 111.32
         cosine_latitude = abs(math.cos(math.radians(latitude)))
@@ -68,9 +68,7 @@ class NearbyEventsView(APIView):
             else min(180, radius_km / (111.32 * cosine_latitude))
         )
 
-        events = Event.objects.filter(
-            status='published',
-            end_datetime__gte=timezone.now(),
+        events = Event.objects.publicly_available(now).filter(
             latitude__isnull=False,
             longitude__isnull=False,
             latitude__gte=max(-90, latitude - latitude_delta),
@@ -149,9 +147,11 @@ class NearbyEventsView(APIView):
         longitude = query.validated_data['longitude']
         radius_km = query.validated_data['radius_km']
         page_number = query.validated_data['page']
+        now = timezone.now()
+        Event.deactivate_due_events(now)
         distance_expression = self._distance_expression(latitude, longitude)
         events = (
-            self._bounded_candidates(latitude, longitude, radius_km)
+            self._bounded_candidates(latitude, longitude, radius_km, now)
             .annotate(distance_km=distance_expression)
             .filter(distance_km__lte=radius_km)
             .order_by('distance_km', 'start_datetime', 'id')
@@ -213,7 +213,9 @@ class EventListCreateView(APIView):
         responses={200: EventSerializer(many=True)}
     )
     def get(self, request):
-        events = Event.objects.filter(status='published').order_by('-start_datetime')  # NOTE: see caveat above — draft vs published
+        now = timezone.now()
+        Event.deactivate_due_events(now)
+        events = Event.objects.publicly_available(now).order_by('-start_datetime')
         return Response(
             EventSerializer(events, many=True, context={"request": request}).data
         )
@@ -255,16 +257,20 @@ class EventListCreateView(APIView):
 
 class EventDetailView(APIView):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
-    permission_classes = [IsAuthenticatedOrReadOnly, IsEventOwnerOrReadOnly]
+    permission_classes = [IsActiveAuthenticatedOrReadOnly, IsEventOwnerOrReadOnly]
 
     def get_object(self, pk):
-        # Draft/cancelled event metadata is visible only to its host. The
+        # Inactive/draft/cancelled metadata is visible only to its host. The
         # public detail endpoint must mirror the public list endpoint.
+        now = timezone.now()
+        Event.deactivate_due_events(now)
         events = Event.objects.filter(pk=pk)
         if self.request.user.is_authenticated:
-            events = events.filter(Q(status='published') | Q(host=self.request.user))
+            events = events.filter(
+                Event.public_availability_filter(now) | Q(host=self.request.user)
+            )
         else:
-            events = events.filter(status='published')
+            events = events.filter(Event.public_availability_filter(now))
         event = get_object_or_404(events)
         self.check_object_permissions(self.request, event)
         return event
@@ -272,7 +278,7 @@ class EventDetailView(APIView):
     @extend_schema(
         tags=['Events'],
         summary="Retrieve a single event",
-        description="Public for published events; hosts may also retrieve their own non-public events.",
+        description="Public for active, available published events; hosts may also retrieve their own inactive or non-public events.",
         responses={200: EventSerializer}
     )
     def get(self, request, pk):
@@ -326,23 +332,21 @@ class EventDetailView(APIView):
 
     @extend_schema(
         tags=['Events'],
-        summary="Delete an event",
-        description="Only the owning host can delete.",
-        responses={200: OpenApiResponse(description="Event deleted")}
+        summary="Deactivate an event",
+        description="Only the owning host can deactivate. The event remains in the database for history and administration.",
+        responses={200: OpenApiResponse(description="Event deactivated")}
     )
     def delete(self, request, pk):
         event = self.get_object(pk)
-        # Do not cascade-delete issued admission credentials. Cancelling keeps
-        # the audit trail and is already enforced by purchase/check-in checks.
-        if event.ticket_types.filter(tickets__isnull=False).exists():
-            event.status = 'cancelled'
-            event.save(update_fields=['status'])
-            return Response(
-                {'success': True, 'message': 'Event cancelled because tickets have already been issued.'},
-                status=status.HTTP_200_OK,
-            )
-        event.delete()
-        return Response({'success': True, 'message': 'Event deleted successfully'}, status=status.HTTP_200_OK)
+        # Retain the event and any related tickets for audit/history instead
+        # of cascading a host deletion through admission records.
+        event.status = 'cancelled'
+        event.is_active = False
+        event.save(update_fields=['status', 'is_active', 'updated_at'])
+        return Response(
+            {'success': True, 'message': 'Event deactivated successfully.'},
+            status=status.HTTP_200_OK,
+        )
 
 
 class MyEventsView(APIView):
@@ -355,6 +359,7 @@ class MyEventsView(APIView):
         responses={200: EventSerializer(many=True)}
     )
     def get(self, request):
+        Event.deactivate_due_events()
         events = Event.objects.filter(host=request.user)
         return Response(
             EventSerializer(events, many=True, context={"request": request}).data

@@ -1,7 +1,9 @@
 from datetime import timedelta
+from io import StringIO
 import math
 
 from django.core.cache import cache
+from django.core.management import call_command
 from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
@@ -63,6 +65,123 @@ class EventVisibilityTests(TestCase):
         response = EventDetailView.as_view()(request, pk=self.event.id)
 
         self.assertEqual(response.status_code, 200)
+
+
+class EventActivityLifecycleTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.host = CustomUser.objects.create_user(
+            username='activity-host',
+            email_address='activity-host@example.com',
+            first_name='Activity',
+            last_name='Host',
+            phone_number='08000000011',
+            password='SafePassword123!',
+            roles='host',
+        )
+        self.now = timezone.now()
+        self.client = APIClient()
+
+    def tearDown(self):
+        cache.clear()
+        super().tearDown()
+
+    def _event(self, title, start_delta=timedelta(hours=2), host=None, **kwargs):
+        return Event.objects.create(
+            host=host or self.host,
+            title=title,
+            venue_name=f'{title} venue',
+            address='5 Lifecycle Street',
+            city='Lagos',
+            latitude=6.5244,
+            longitude=3.3792,
+            start_datetime=self.now + start_delta,
+            end_datetime=kwargs.pop('end_datetime', self.now + start_delta + timedelta(hours=2)),
+            status=kwargs.pop('status', 'published'),
+            **kwargs,
+        )
+
+    def test_due_events_are_persistently_deactivated(self):
+        future = self._event('Future event')
+        imminent = self._event('Imminent event', start_delta=timedelta(seconds=30))
+        past = self._event(
+            'Past event',
+            start_delta=-timedelta(hours=2),
+            end_datetime=self.now - timedelta(hours=1),
+        )
+
+        self.assertTrue(future.is_active)
+        self.assertFalse(imminent.is_active)
+        self.assertFalse(past.is_active)
+
+        # QuerySet.update bypasses model save; the lifecycle job must still
+        # correct stale data atomically.
+        Event.objects.filter(pk=imminent.pk).update(is_active=True)
+        Event.deactivate_due_events(self.now)
+        imminent.refresh_from_db()
+        self.assertFalse(imminent.is_active)
+
+    def test_public_discovery_hides_inactive_due_and_inactive_host_events(self):
+        visible = self._event('Visible event')
+        inactive = self._event('Inactive event')
+        Event.objects.filter(pk=inactive.pk).update(is_active=False)
+        imminent = self._event('Imminent event', start_delta=timedelta(seconds=30))
+        disabled_host = CustomUser.objects.create_user(
+            username='disabled-event-host',
+            email_address='disabled-event-host@example.com',
+            first_name='Disabled',
+            last_name='Host',
+            phone_number='08000000012',
+            password='SafePassword123!',
+            roles='host',
+        )
+        hidden_by_host = self._event('Disabled host event', host=disabled_host)
+        disabled_host.is_active = False
+        disabled_host.save(update_fields=['is_active'])
+
+        listed = self.client.get(reverse('event-list-create'))
+        nearby = self.client.get(
+            reverse('nearby-events'),
+            {'latitude': 6.5244, 'longitude': 3.3792},
+        )
+        anonymous_detail = self.client.get(
+            reverse('event-detail', args=[inactive.pk])
+        )
+        owner_client = APIClient()
+        owner_client.force_authenticate(self.host)
+        owner_detail = owner_client.get(reverse('event-detail', args=[inactive.pk]))
+
+        list_ids = {item['id'] for item in listed.data}
+        nearby_ids = {item['id'] for item in nearby.data['results']}
+        self.assertEqual(list_ids, {str(visible.pk)})
+        self.assertEqual(nearby_ids, {str(visible.pk)})
+        self.assertNotIn(str(imminent.pk), list_ids)
+        self.assertNotIn(str(hidden_by_host.pk), list_ids)
+        self.assertEqual(anonymous_detail.status_code, 404)
+        self.assertEqual(owner_detail.status_code, 200)
+
+    def test_host_delete_soft_deactivates_event(self):
+        event = self._event('Soft deleted event')
+        self.client.force_authenticate(self.host)
+
+        response = self.client.delete(reverse('event-detail', args=[event.pk]))
+
+        self.assertEqual(response.status_code, 200)
+        event.refresh_from_db()
+        self.assertEqual(event.status, 'cancelled')
+        self.assertFalse(event.is_active)
+        self.assertTrue(Event.objects.filter(pk=event.pk).exists())
+
+    def test_scheduled_command_deactivates_stale_event(self):
+        due_event = self._event('Cron deactivation', start_delta=timedelta(seconds=30))
+        Event.objects.filter(pk=due_event.pk).update(is_active=True)
+        output = StringIO()
+
+        call_command('deactivate_due_events', stdout=output)
+
+        due_event.refresh_from_db()
+        self.assertFalse(due_event.is_active)
+        self.assertIn('Deactivated 1 event(s).', output.getvalue())
 
 
 class NearbyEventsTests(TestCase):

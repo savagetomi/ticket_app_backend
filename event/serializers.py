@@ -17,9 +17,11 @@ class EventSerializer(serializers.ModelSerializer):
             'id', 'host', 'title', 'description', 'category', 'cover_image',
             'venue_name', 'address', 'city', 'state', 'country',
             'latitude', 'longitude', 'start_datetime', 'end_datetime',
-            'status', 'is_sold_out', 'created_at', 'updated_at',
+            'status', 'is_active', 'is_sold_out', 'created_at', 'updated_at',
         ]
-        read_only_fields = ['id', 'host', 'created_at', 'updated_at']
+        # Event activity is lifecycle-controlled. Hosts can see the state in
+        # their dashboard but cannot reactivate expired or cancelled events.
+        read_only_fields = ['id', 'host', 'is_active', 'created_at', 'updated_at']
 
 
     def validate(self, attrs):

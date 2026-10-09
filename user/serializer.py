@@ -94,6 +94,31 @@ class UserSerializer(serializers.ModelSerializer):
         model = CustomUser
         fields = ['id', 'email_address', 'username', 'phone_number', 'roles','created_at']
 
+
+class InactiveUserAdminSerializer(serializers.ModelSerializer):
+    """Account details visible only to authorized account administrators.
+
+    Sensitive authentication material (password hashes, OTP records, tokens,
+    IP addresses, and precise location) is deliberately omitted.
+    """
+
+    class Meta:
+        model = CustomUser
+        fields = [
+            'id',
+            'first_name',
+            'last_name',
+            'email_address',
+            'username',
+            'phone_number',
+            'roles',
+            'email_verified',
+            'is_active',
+            'created_at',
+            'updated_at',
+        ]
+
+
 class UserUpdateSerializer(serializers.ModelSerializer):
     """
     Restricted serializer for self-service profile edits.

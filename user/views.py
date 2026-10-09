@@ -4,10 +4,12 @@ from utils.email import send_otp_email
 
 from django.contrib.auth import authenticate
 from django.db import transaction
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
 
 from drf_spectacular.utils import extend_schema, OpenApiResponse, inline_serializer
 from rest_framework import serializers, status
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -15,8 +17,14 @@ from rest_framework_simplejwt.serializers import TokenRefreshSerializer
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 
-from .models import CustomUser, OTP
-from .serializer import UserRegistrationSerializers, UserSerializer, UserUpdateSerializer
+from .models import CustomUser, OTP, UserSession
+from .permissions import IsAccountAdministrator, IsActiveAuthenticated
+from .serializer import (
+    InactiveUserAdminSerializer,
+    UserRegistrationSerializers,
+    UserSerializer,
+    UserUpdateSerializer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +155,7 @@ class LoginView(APIView):
 
 
 class LogoutView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsActiveAuthenticated]
 
     @extend_schema(
         tags=["Authentication"],
@@ -221,7 +229,7 @@ class LogoutView(APIView):
 
 
 class ProfileView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsActiveAuthenticated]
 
     @extend_schema(
         tags=['Authentication'],
@@ -311,22 +319,112 @@ class ProfileView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        if not request.user.check_password(password):
-            return Response(
-                {'message': 'Incorrect password.'},
-                status=status.HTTP_401_UNAUTHORIZED
-            )
-
-        # Revoke every outstanding refresh token so old sessions can't refresh
-        # their way back to a live access token after deactivation.
+        # Lock the account before revoking credentials so concurrent deletion
+        # attempts cannot leave a partially deactivated account behind.
         with transaction.atomic():
-            for token in OutstandingToken.objects.filter(user=request.user):
+            account = CustomUser.objects.select_for_update().get(pk=request.user.pk)
+            if not account.check_password(password):
+                return Response(
+                    {'message': 'Incorrect password.'},
+                    status=status.HTTP_401_UNAUTHORIZED
+                )
+
+            # Revoke every outstanding refresh token so old sessions cannot
+            # refresh their way back to a live access token after deactivation.
+            for token in OutstandingToken.objects.filter(user=account):
                 BlacklistedToken.objects.get_or_create(token=token)
 
-            request.user.is_active = False
-            request.user.save(update_fields=['is_active'])
+            # UserSession is a legacy/session-audit table. Marking it inactive
+            # avoids treating an old login as current if it is consumed later.
+            UserSession.objects.filter(user=account, is_active=True).update(
+                is_active=False,
+                logout_at=timezone.now(),
+            )
+
+            account.is_active = False
+            account.save(update_fields=['is_active'])
 
         return Response({'message': 'Account deactivated successfully'}, status=status.HTTP_200_OK)
+
+
+class InactiveUserDetailView(APIView):
+    """Allow a designated administrator to inspect a soft-deleted account."""
+
+    permission_classes = [IsAccountAdministrator]
+
+    @extend_schema(
+        tags=['Account administration'],
+        summary='Retrieve a deactivated account',
+        description=(
+            'Returns limited account details only when the target account is '
+            'deactivated. Requires an active superuser or an active staff '
+            'account with the application admin role.'
+        ),
+        responses={
+            200: inline_serializer(
+                name='InactiveUserDetailResponse',
+                fields={'user': InactiveUserAdminSerializer()},
+            ),
+            403: OpenApiResponse(description='Administrator permissions are required.'),
+            404: OpenApiResponse(description='No deactivated account matches this ID.'),
+        },
+    )
+    def get(self, request, user_id):
+        account = get_object_or_404(
+            CustomUser.objects.filter(is_active=False),
+            pk=user_id,
+        )
+        return Response({'user': InactiveUserAdminSerializer(account).data})
+
+
+class ReactivateUserView(APIView):
+    """Allow a designated administrator to restore a soft-deleted account."""
+
+    permission_classes = [IsAccountAdministrator]
+
+    @extend_schema(
+        tags=['Account administration'],
+        summary='Reactivate a deactivated account',
+        description=(
+            'Restores a deactivated account. Its previously blacklisted '
+            'refresh tokens stay revoked, so the user must log in again.'
+        ),
+        request=None,
+        responses={
+            200: inline_serializer(
+                name='ReactivateUserResponse',
+                fields={
+                    'message': serializers.CharField(),
+                    'user': InactiveUserAdminSerializer(),
+                },
+            ),
+            403: OpenApiResponse(description='Administrator permissions are required.'),
+            404: OpenApiResponse(description='No deactivated account matches this ID.'),
+        },
+    )
+    def post(self, request, user_id):
+        # Lock and filter in one query. A second concurrent reactivation sees
+        # no inactive row once the first transaction has completed.
+        with transaction.atomic():
+            account = get_object_or_404(
+                CustomUser.objects.select_for_update().filter(is_active=False),
+                pk=user_id,
+            )
+            account.is_active = True
+            account.save(update_fields=['is_active'])
+
+        logger.info(
+            'Administrator %s reactivated account %s.',
+            request.user.pk,
+            account.pk,
+        )
+        return Response(
+            {
+                'message': 'Account reactivated successfully. The user must log in again.',
+                'user': InactiveUserAdminSerializer(account).data,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class VerifyOTPView(APIView):
@@ -399,7 +497,7 @@ class VerifyOTPView(APIView):
             # Verified accounts authenticate through login, never through an
             # anonymously requested OTP. This prevents OTP issuance from
             # becoming a password-reset/account-takeover path.
-            if user.email_verified:
+            if not user.is_active or user.email_verified:
                 return Response(
                     {'success': False, 'message': 'Invalid verification request.'},
                     status=status.HTTP_400_BAD_REQUEST,
@@ -528,7 +626,7 @@ class ResendOTPView(APIView):
 
         try:
             user = CustomUser.objects.get(email_address=email)
-            if user.email_verified:
+            if not user.is_active or user.email_verified:
                 return Response({'message': self.GENERIC_MESSAGE, 'success': True})
 
             # The helper locks the one-to-one OTP row before inspecting the
@@ -590,7 +688,7 @@ class GenerateOTPView(APIView):
 
         try:
             user = CustomUser.objects.get(email_address=email)
-            if user.email_verified:
+            if not user.is_active or user.email_verified:
                 return Response({'success': True, 'message': self.GENERIC_MESSAGE})
 
             code, outcome = OTP.issue_code_for_user(

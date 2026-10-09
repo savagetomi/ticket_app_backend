@@ -15,3 +15,22 @@ building a backend sytem for ticket sale
 When a user changes the radius dropdown, request the endpoint again with the
 new `radius_km` value and reset `page` to `1`. The backend has no frontend in
 this repository, so the UI performs that refresh.
+
+## Event availability lifecycle
+
+Events are soft-deactivated rather than deleted. The public API only exposes
+published, active events whose start is more than one minute away. Run the
+following command every minute in production to persist the time-based
+deactivation even when the API is idle:
+
+`python manage.py deactivate_due_events`
+
+## Account deactivation and recovery
+
+`DELETE /auth/profile/` now deactivates an account without removing its data.
+Existing refresh tokens are revoked, and the account cannot log in or use
+protected endpoints while inactive. An active superuser, or an active staff
+account with the `admin` role, can inspect and restore a deactivated account:
+
+- `GET /auth/admin/users/<user-id>/`
+- `POST /auth/admin/users/<user-id>/reactivate/`

@@ -1,7 +1,11 @@
+from datetime import timedelta
+
+from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
 
+from event.models import Event
 from .models import Ticket, TicketType
 
 
@@ -118,16 +122,45 @@ class TicketSerializer(serializers.ModelSerializer):
 
 class PurchaseTicketSerializer(serializers.Serializer):
     MAX_TICKETS_PER_ORDER = 10
+    SALE_CLOSE_BUFFER = timedelta(minutes=1)
 
     ticket_type = serializers.UUIDField()
     quantity = serializers.IntegerField(min_value=1, max_value=MAX_TICKETS_PER_ORDER)
 
-    @staticmethod
-    def _validate_sale_is_open(ticket_type):
-        event = ticket_type.event
-        now = timezone.now()
+    @classmethod
+    def refresh_event_lifecycle(cls, now=None):
+        """Persist time-based event deactivations before exposing ticket sales."""
+        now = now or timezone.now()
+        Event.deactivate_due_events(now=now)
+        return now
 
-        if event.status != 'published':
+    @classmethod
+    def event_is_available_for_sale(cls, event, now):
+        """Return whether an event may still expose or sell ticket types."""
+        return (
+            event.status == 'published'
+            and event.is_active
+            and event.host.is_active
+            and event.start_datetime > now + cls.SALE_CLOSE_BUFFER
+            and event.end_datetime > now
+        )
+
+    @classmethod
+    def event_allows_ticket_type_configuration(cls, event, now):
+        """Allow a host to prepare a future draft without opening sales."""
+        return (
+            event.status not in {'cancelled', 'completed'}
+            and event.is_active
+            and event.host.is_active
+            and event.start_datetime > now + cls.SALE_CLOSE_BUFFER
+            and event.end_datetime > now
+        )
+
+    @classmethod
+    def _validate_sale_is_open(cls, ticket_type, now):
+        event = ticket_type.event
+
+        if not cls.event_is_available_for_sale(event, now):
             raise serializers.ValidationError(
                 {'ticket_type': 'Tickets are not available for this event.'}
             )
@@ -147,8 +180,11 @@ class PurchaseTicketSerializer(serializers.Serializer):
 
     def validate(self, attrs):
         # Fast, friendly upfront check. Not the authoritative one — see create().
-        ticket_type = TicketType.objects.select_related('event').get(id=attrs['ticket_type'])
-        self._validate_sale_is_open(ticket_type)
+        now = self.refresh_event_lifecycle()
+        ticket_type = TicketType.objects.select_related('event__host').get(
+            id=attrs['ticket_type']
+        )
+        self._validate_sale_is_open(ticket_type, now)
         if ticket_type.quantity_remaining < attrs['quantity']:
             raise serializers.ValidationError(
                 {"quantity": f"Only {ticket_type.quantity_remaining} ticket(s) left for '{ticket_type.name}'."}
@@ -163,14 +199,26 @@ class PurchaseTicketSerializer(serializers.Serializer):
         # quantity_sold, and correctly fails instead of both succeeding
         # (which would oversell the event). Note: this only actually locks on
         # Postgres/MySQL — it's a silent no-op on SQLite.
-        ticket_type = TicketType.objects.select_for_update().select_related('event').get(
+        now = self.refresh_event_lifecycle()
+        ticket_type = TicketType.objects.select_for_update().get(
             id=validated_data['ticket_type']
         )
+        event = Event.objects.select_for_update().select_related('host').get(
+            pk=ticket_type.event_id
+        )
+        # A user account may be deactivated concurrently with a purchase.
+        # Lock and re-read it before the authoritative availability check.
+        host = get_user_model().objects.select_for_update().get(pk=event.host_id)
+        event.host = host
+        if event.is_active and event.should_be_inactive(now):
+            event.is_active = False
+            event.save(update_fields=['is_active', 'updated_at'])
+        ticket_type.event = event
         quantity = validated_data['quantity']
 
         # Re-check after locking so a sale closing or event state change cannot
         # be bypassed between serializer validation and ticket creation.
-        self._validate_sale_is_open(ticket_type)
+        self._validate_sale_is_open(ticket_type, now)
 
         if ticket_type.quantity_remaining < quantity:
             raise serializers.ValidationError(
